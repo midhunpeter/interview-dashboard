@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#102521" />
+    <meta
+      name="description"
+      content="A private, local interview preparation dashboard."
+    />
+    <title>Interview Prep Dashboard</title>
+  </head>
+  <body>
+    <div id="root">
+      <div id="file-launch-help" style="display:none;max-width:680px;margin:12vh auto;padding:36px;border:1px solid #d9d3c7;border-radius:16px;background:#fbfaf6;color:#182724;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;box-shadow:0 14px 35px rgba(31,46,41,.08)">
+        <p style="margin:0 0 10px;color:#777d73;font-size:11px;font-weight:700;letter-spacing:.15em;text-transform:uppercase">Local dashboard</p>
+        <h1 style="margin:0 0 14px;font:500 34px Georgia,serif">Launch the local app first</h1>
+        <p style="margin:0;color:#626e69;line-height:1.65">This React application cannot run directly from a <code>file://</code> address. Double-click <strong>Start Interview Dashboard.command</strong> in the project folder, then use the localhost page it opens.</p>
+      </div>
+    </div>
+    <script>
+      if (window.location.protocol === "file:") {
+        document.getElementById("file-launch-help").style.display = "block";
+      }
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

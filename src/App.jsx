@@ -1,0 +1,900 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  MODULES,
+  SCHEMA_VERSION,
+  STATUSES,
+  createInitialData,
+  createId,
+  loadData,
+  moduleReadiness,
+  overallReadiness,
+  saveData,
+  uploadItemImage,
+  deleteItemImage,
+} from "./data";
+
+const TYPE_LABELS = {
+  note: "Note",
+  pitch: "Pitch",
+  question: "Question & answer",
+  story: "Story",
+  incident: "Incident",
+  knowledge: "Knowledge",
+  translation: "Translation",
+  research: "Research",
+  "open-question": "Open question",
+};
+
+const makeItem = (moduleId) => {
+  const timestamp = new Date().toISOString();
+  return {
+    id: createId(),
+    type: moduleId === "data-platform-translation" ? "translation" : "note",
+    module: moduleId,
+    title: "Untitled prep item",
+    tags: [],
+    status: "not-started",
+    priority: "medium",
+    starred: false,
+    sortOrder: Date.now(),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    content: moduleId === "data-platform-translation"
+      ? { notes: "", schedulingMachinePattern: "", tempusProblem: "", whatIBring: "" }
+      : { notes: "" },
+  };
+};
+
+function App() {
+  const [data, setData] = useState(createInitialData);
+  const [view, setView] = useState("home");
+  const [query, setQuery] = useState("");
+  const [saveState, setSaveState] = useState("Loading…");
+  const [notice, setNotice] = useState("");
+  const importRef = useRef(null);
+  const hydrated = useRef(false);
+  const modules = useMemo(() => data.settings.preparationModules || MODULES, [data.settings.preparationModules]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadData()
+      .then((loaded) => {
+        if (cancelled) return;
+        hydrated.current = true;
+        setData(loaded);
+        setSaveState("Saved to SQLite");
+      })
+      .catch((error) => {
+        console.error(error);
+        if (!cancelled) setSaveState("Load failed");
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated.current) return undefined;
+    setSaveState("Saving…");
+    const timer = window.setTimeout(() => {
+      saveData(data)
+        .then(() => setSaveState("Saved to SQLite"))
+        .catch((error) => {
+          console.error(error);
+          setSaveState("Save failed");
+        });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [data]);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const timer = window.setTimeout(() => setNotice(""), 3500);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    const focusSearch = (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        document.querySelector('[aria-label="Search all preparation content"]')?.focus();
+      }
+    };
+    window.addEventListener("keydown", focusSearch);
+    return () => window.removeEventListener("keydown", focusSearch);
+  }, []);
+
+  const searchResults = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return [];
+    const items = data.items.filter((item) => {
+      const haystack = [item.title, item.type, ...(item.tags || []), ...Object.values(item.content || {})]
+        .filter((value) => typeof value === "string")
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    }).map((item) => ({ ...item, kind: "item" }));
+    const trees = data.drillTrees.filter((tree) => {
+      const haystack = [tree.title, ...(tree.tags || []), ...tree.nodes.flatMap((node) => [node.question, node.myAnswer])]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    }).map((tree) => ({ ...tree, kind: "drill" }));
+    return [...items, ...trees];
+  }, [data, query]);
+
+  const navigate = (nextView) => {
+    setView(nextView);
+    setQuery("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const updateItem = (id, patch) => {
+    setData((current) => ({
+      ...current,
+      items: current.items.map((item) => item.id === id
+        ? { ...item, ...patch, updatedAt: new Date().toISOString() }
+        : item),
+    }));
+  };
+
+  const moveItem = (id, direction) => {
+    setData((current) => {
+      const item = current.items.find((entry) => entry.id === id);
+      if (!item) return current;
+      const ordered = current.items.filter((entry) => entry.module === item.module).sort((a, b) => a.sortOrder - b.sortOrder);
+      const index = ordered.findIndex((entry) => entry.id === id);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= ordered.length) return current;
+      [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+      const sortOrders = new Map(ordered.map((entry, order) => [entry.id, order]));
+      return {
+        ...current,
+        items: current.items.map((entry) => sortOrders.has(entry.id)
+          ? { ...entry, sortOrder: sortOrders.get(entry.id), updatedAt: new Date().toISOString() }
+          : entry),
+      };
+    });
+  };
+
+  const deleteItem = async (id) => {
+    const item = data.items.find((entry) => entry.id === id);
+    if (!item || !window.confirm(`Delete “${item.title}”?`)) return;
+    try {
+      await Promise.all((item.images || []).map((image) => deleteItemImage(image.id)));
+    } catch (error) {
+      console.error(error);
+      setNotice("Item could not be deleted");
+      return;
+    }
+    setData((current) => ({ ...current, items: current.items.filter((entry) => entry.id !== id) }));
+    setNotice("Item deleted");
+  };
+
+  const duplicateItem = (item) => {
+    const timestamp = new Date().toISOString();
+    setData((current) => ({
+      ...current,
+      items: [...current.items, { ...item, id: createId(), title: `${item.title} copy`, images: [], sortOrder: Date.now(), createdAt: timestamp, updatedAt: timestamp }],
+    }));
+    setNotice("Item duplicated");
+  };
+
+  const addItem = (moduleId) => {
+    const item = makeItem(moduleId);
+    setData((current) => ({ ...current, items: [...current.items, item] }));
+    window.setTimeout(() => document.getElementById(`item-${item.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+  };
+
+  const addImagesToItem = async (itemId, fileList) => {
+    const files = [...fileList];
+    if (!files.length) return;
+    setSaveState("Saving…");
+    try {
+      await saveData(data);
+      const uploaded = [];
+      for (const file of files) uploaded.push(await uploadItemImage(itemId, file));
+      setData((current) => ({
+        ...current,
+        items: current.items.map((item) => item.id === itemId ? { ...item, images: [...(item.images || []), ...uploaded] } : item),
+      }));
+      setSaveState("Saved to SQLite");
+      setNotice(`${uploaded.length} image${uploaded.length === 1 ? "" : "s"} added`);
+    } catch (error) {
+      console.error(error);
+      setSaveState("Save failed");
+      setNotice(error.message || "Image upload failed");
+    }
+  };
+
+  const removeImageFromItem = async (itemId, image) => {
+    if (!window.confirm(`Delete “${image.filename}”?`)) return;
+    try {
+      await deleteItemImage(image.id);
+      setData((current) => ({
+        ...current,
+        items: current.items.map((item) => item.id === itemId ? { ...item, images: (item.images || []).filter((entry) => entry.id !== image.id) } : item),
+      }));
+      setNotice("Image deleted");
+    } catch (error) {
+      console.error(error);
+      setNotice(error.message || "Image delete failed");
+    }
+  };
+
+  const saveNow = async (snapshot = data) => {
+    setSaveState("Saving…");
+    try {
+      await saveData(snapshot);
+      setSaveState("Saved to SQLite");
+      setNotice("Preparation saved");
+      return true;
+    } catch (error) {
+      console.error(error);
+      setSaveState("Save failed");
+      setNotice("Save failed");
+      return false;
+    }
+  };
+
+  const deletePreparationSection = async (sectionId) => {
+    const section = (data.settings.preparationModules || []).find((entry) => entry.id === sectionId);
+    if (section && !window.confirm(`Delete the “${section.label}” preparation section and all of its items?`)) return false;
+    const nextData = {
+      ...data,
+      settings: { ...data.settings, preparationModules: (data.settings.preparationModules || []).filter((entry) => entry.id !== sectionId) },
+      items: data.items.filter((item) => item.module !== sectionId),
+      drillTrees: data.drillTrees.filter((tree) => tree.module !== sectionId),
+    };
+    const saved = await saveNow(nextData);
+    if (saved) setData(nextData);
+    return saved;
+  };
+
+  const reorderPreparationSections = async (preparationModules) => {
+    const nextData = { ...data, settings: { ...data.settings, preparationModules } };
+    const saved = await saveNow(nextData);
+    if (saved) setData(nextData);
+    return saved;
+  };
+
+  const updateTree = (treeId, updater) => {
+    setData((current) => ({
+      ...current,
+      drillTrees: current.drillTrees.map((tree) => tree.id === treeId
+        ? { ...updater(tree), updatedAt: new Date().toISOString() }
+        : tree),
+    }));
+  };
+
+  const addTree = (moduleId) => {
+    const timestamp = new Date().toISOString();
+    const tree = {
+      id: createId(),
+      module: moduleId,
+      title: "Untitled drill tree",
+      tags: [],
+      priority: "high",
+      starred: false,
+      sortOrder: Date.now(),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      nodes: [{ id: createId(), parentId: null, level: 0, question: "Root question", myAnswer: "", status: "not-started", sortOrder: 0 }],
+    };
+    setData((current) => ({ ...current, drillTrees: [...current.drillTrees, tree] }));
+    setNotice("Drill tree added");
+  };
+
+  const deleteTree = (treeId) => {
+    const tree = data.drillTrees.find((entry) => entry.id === treeId);
+    if (!tree || !window.confirm(`Delete drill tree “${tree.title}”?`)) return;
+    setData((current) => ({ ...current, drillTrees: current.drillTrees.filter((entry) => entry.id !== treeId) }));
+    setNotice("Drill tree deleted");
+  };
+
+  const exportData = () => {
+    const payload = { ...data, exportedAt: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `interview-prep-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setNotice("Backup exported");
+  };
+
+  const importData = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      if (parsed.schemaVersion !== SCHEMA_VERSION || !Array.isArray(parsed.items) || !Array.isArray(parsed.drillTrees) || !parsed.settings) {
+        throw new Error("This file is not a valid dashboard backup.");
+      }
+      const summary = `${parsed.items.length} items and ${parsed.drillTrees.length} drill trees`;
+      if (!window.confirm(`Import ${summary}? This will replace the current dashboard after a backup is downloaded.`)) return;
+      exportData();
+      setData({
+        ...parsed,
+        settings: {
+          ...parsed.settings,
+          preparationModules: parsed.settings.preparationModules || [...MODULES, ...(parsed.settings.customModules || [])],
+        },
+      });
+      setNotice("Backup imported");
+    } catch (error) {
+      window.alert(error.message || "The selected backup could not be imported.");
+    }
+  };
+
+  const module = modules.find((entry) => entry.id === view);
+
+  return (
+    <div className="app-shell">
+      <Sidebar view={view} data={data} modules={modules} onNavigate={navigate} />
+      <div className="workspace">
+        <Header
+          company={data.settings.companyName}
+          query={query}
+          setQuery={setQuery}
+          saveState={saveState}
+          onNavigate={navigate}
+        />
+        {query.trim() ? (
+          <SearchResults query={query} results={searchResults} modules={modules} onNavigate={navigate} />
+        ) : view === "home" ? (
+          <Dashboard data={data} modules={modules} onNavigate={navigate} />
+        ) : view === "quick-review" ? (
+          <QuickReview data={data} modules={modules} updateItem={updateItem} updateTree={updateTree} saveNow={saveNow} onNavigate={navigate} />
+        ) : view === "settings" ? (
+          <Settings
+            data={data}
+            setData={setData}
+            exportData={exportData}
+            importData={() => importRef.current?.click()}
+            resetData={() => {
+              if (window.confirm("Reset the dashboard to its starter content? Export a backup first if you need the current data.")) {
+                setData(createInitialData());
+                setNotice("Dashboard reset");
+              }
+            }}
+            deletePreparationSection={deletePreparationSection}
+            reorderPreparationSections={reorderPreparationSections}
+          />
+        ) : module ? (
+          <ModuleView
+            module={module}
+            data={data}
+            updateItem={updateItem}
+            moveItem={moveItem}
+            deleteItem={deleteItem}
+            duplicateItem={duplicateItem}
+            addItem={addItem}
+            saveNow={saveNow}
+            addImagesToItem={addImagesToItem}
+            removeImageFromItem={removeImageFromItem}
+            updateTree={updateTree}
+            addTree={addTree}
+            deleteTree={deleteTree}
+          />
+        ) : null}
+      </div>
+      <input ref={importRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={importData} />
+      {notice && <div className="toast" role="status">{notice}</div>}
+    </div>
+  );
+}
+
+function Sidebar({ view, data, modules, onNavigate }) {
+  return (
+    <aside className="sidebar">
+      <button className="brand" onClick={() => onNavigate("home")} aria-label="Go to dashboard home">
+        <span className="brand-mark">IP</span>
+        <span><strong>Interview Prep</strong><small>Private workspace</small></span>
+      </button>
+      <nav aria-label="Primary navigation">
+        <p className="nav-label">Overview</p>
+        <button className={view === "home" ? "nav-item active" : "nav-item"} onClick={() => onNavigate("home")}>
+          <span className="nav-icon">⌂</span><span>Dashboard</span>
+        </button>
+        <button className={view === "quick-review" ? "nav-item active" : "nav-item"} onClick={() => onNavigate("quick-review")}>
+          <span className="nav-icon">★</span><span>Quick review</span>
+        </button>
+        <p className="nav-label">Preparation</p>
+        {modules.map((module) => {
+          const readiness = moduleReadiness(data, module.id);
+          return (
+            <button key={module.id} className={view === module.id ? "nav-item active" : "nav-item"} onClick={() => onNavigate(module.id)}>
+              <span className="module-dot" style={{ background: module.color }}>{module.short}</span>
+              <span className="nav-text">{module.label}</span>
+              <span className="nav-progress">{readiness === null ? "—" : `${readiness}%`}</span>
+            </button>
+          );
+        })}
+      </nav>
+      <button className={view === "settings" ? "nav-item sidebar-footer active" : "nav-item sidebar-footer"} onClick={() => onNavigate("settings")}>
+        <span className="nav-icon">⚙</span><span>Settings & backup</span>
+      </button>
+    </aside>
+  );
+}
+
+function Header({ company, query, setQuery, saveState, onNavigate }) {
+  return (
+    <header className="topbar">
+      <label className="search-box">
+        <span aria-hidden="true">⌕</span>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search questions, answers, tags, and notes…" aria-label="Search all preparation content" />
+        <kbd>⌘ K</kbd>
+      </label>
+      <span className={`save-state ${saveState.endsWith("failed") ? "error" : ""}`}><i />{saveState}</span>
+      <button className="company-chip" onClick={() => onNavigate("settings")}>{company || "Set company"}</button>
+    </header>
+  );
+}
+
+function Dashboard({ data, modules, onNavigate }) {
+  const overall = overallReadiness(data, modules);
+  const focus = useMemo(() => {
+    const rank = (item) => {
+      if (item.starred && item.status !== "confident") return 1;
+      if (item.priority === "high" && item.status !== "confident") return 2;
+      return item.status === "confident" ? 5 : 4;
+    };
+    return [...data.items]
+      .filter((item) => item.status !== "confident")
+      .sort((a, b) => rank(a) - rank(b) || new Date(b.updatedAt) - new Date(a.updatedAt))
+      .slice(0, 10);
+  }, [data.items]);
+  const days = countdown(data.settings.interviewDate);
+
+  return (
+    <main className="page dashboard-page">
+      <section className="hero-row">
+        <div>
+          <p className="eyebrow">{data.settings.interviewStage || "Interview preparation"}</p>
+          <h1>Ready for the conversation,<br />not just the questions.</h1>
+          <p className="hero-copy">Build depth, rehearse the follow-ups, and keep your strongest evidence close at hand.</p>
+        </div>
+        <div className="countdown-card">
+          <span className="eyebrow">Interview countdown</span>
+          <strong>{days === null ? "Set a date" : days < 0 ? "Interview complete" : `${days} day${days === 1 ? "" : "s"}`}</strong>
+          <small>{data.settings.interviewDate ? formatDate(data.settings.interviewDate) : "Add the interview date in Settings"}</small>
+        </div>
+      </section>
+
+      <section className="overview-grid">
+        <article className="readiness-card panel">
+          <div className="panel-heading"><div><p className="eyebrow">Overall readiness</p><h2>Your preparation pulse</h2></div></div>
+          <div className="readiness-content">
+            <div className="readiness-ring" style={{ "--progress": `${overall ?? 0}%` }}><span><strong>{overall ?? 0}%</strong><small>ready</small></span></div>
+            <div className="readiness-legend">
+              <p><span className="legend-dot confident" />Confident <strong>{data.items.filter((item) => item.status === "confident").length}</strong></p>
+              <p><span className="legend-dot reviewed" />Reviewed <strong>{data.items.filter((item) => item.status === "reviewed").length}</strong></p>
+              <p><span className="legend-dot not-started" />Not started <strong>{data.items.filter((item) => item.status === "not-started").length}</strong></p>
+            </div>
+          </div>
+        </article>
+        <article className="panel focus-card">
+          <div className="panel-heading"><div><p className="eyebrow">Focus today</p><h2>Highest-leverage work</h2></div><span className="count-pill">{focus.length}</span></div>
+          <div className="focus-list">
+            {focus.slice(0, 4).map((item) => {
+              const module = modules.find((entry) => entry.id === item.module);
+              return (
+                <button key={item.id} onClick={() => onNavigate(item.module)}>
+                  <span className="module-dot" style={{ background: module?.color }}>{module?.short}</span>
+                  <span><strong>{item.title}</strong><small>{module?.label} · {item.status.replace("-", " ")}</small></span>
+                  <span aria-hidden="true">→</span>
+                </button>
+              );
+            })}
+          </div>
+        </article>
+      </section>
+
+      <section className="modules-section">
+        <div className="section-heading"><div><p className="eyebrow">Preparation sections</p><h2>Preparation map</h2></div><button className="text-button" onClick={() => onNavigate("quick-review")}>Open quick review →</button></div>
+        <div className="module-grid">
+          {modules.map((module, index) => {
+            const progress = moduleReadiness(data, module.id);
+            const count = data.items.filter((item) => item.module === module.id).length;
+            return (
+              <button className="module-card" key={module.id} onClick={() => onNavigate(module.id)}>
+                <span className="module-number">0{index + 1}</span>
+                <span className="module-dot large" style={{ background: module.color }}>{module.short}</span>
+                <h3>{module.label}</h3>
+                <p>{module.description}</p>
+                <span className="progress-meta"><span>{count} item{count === 1 ? "" : "s"}</span><strong>{progress === null ? "Not started" : `${progress}%`}</strong></span>
+                <span className="progress-track"><i style={{ width: `${progress ?? 0}%`, background: module.color }} /></span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateItem, addItem, saveNow, addImagesToItem, removeImageFromItem, updateTree, addTree, deleteTree }) {
+  const items = data.items.filter((item) => item.module === module.id).sort((a, b) => a.sortOrder - b.sortOrder);
+  const trees = data.drillTrees.filter((tree) => tree.module === module.id);
+  const progress = moduleReadiness(data, module.id);
+  return (
+    <main className="page">
+      <section className="module-header">
+        <div className="module-dot hero-icon" style={{ background: module.color }}>{module.short}</div>
+        <div><p className="eyebrow">Preparation module</p><h1>{module.label}</h1><p>{module.description}</p></div>
+        <div className="module-score"><strong>{progress ?? 0}%</strong><span>readiness</span></div>
+      </section>
+      <div className="section-heading content-heading"><div><p className="eyebrow">Working set</p><h2>Your preparation items</h2></div><button className="primary-button" onClick={() => addItem(module.id)}>＋ Add item</button></div>
+      <section className="item-list">
+        {items.length === 0 && <EmptyState onAdd={() => addItem(module.id)} />}
+        {items.map((item, index) => <ItemEditor key={item.id} item={item} module={module} updateItem={updateItem} moveItem={moveItem} canMoveUp={index > 0} canMoveDown={index < items.length - 1} deleteItem={deleteItem} duplicateItem={duplicateItem} saveNow={saveNow} addImagesToItem={addImagesToItem} removeImageFromItem={removeImageFromItem} />)}
+      </section>
+      {(module.id === "hiring-manager-simulation" || trees.length > 0) && (
+        <DrillSection module={module} trees={trees} updateTree={updateTree} addTree={addTree} deleteTree={deleteTree} />
+      )}
+    </main>
+  );
+}
+
+function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown, deleteItem, duplicateItem, saveNow, addImagesToItem, removeImageFromItem }) {
+  const [open, setOpen] = useState(item.title === "Untitled prep item");
+  const [tagInput, setTagInput] = useState(() => (item.tags || []).join(", "));
+  const [previewImage, setPreviewImage] = useState(null);
+  useEffect(() => {
+    if (!previewImage) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event) => event.key === "Escape" && setPreviewImage(null);
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [previewImage]);
+  const setContent = (key, value) => updateItem(item.id, { content: { ...item.content, [key]: value } });
+  return (
+    <article id={`item-${item.id}`} className={`item-card ${open ? "open" : ""}`}>
+      <div className="item-summary">
+        <button className="star-button" aria-label={item.starred ? "Unstar item" : "Star item"} onClick={() => updateItem(item.id, { starred: !item.starred })}>{item.starred ? "★" : "☆"}</button>
+        <button className="item-title-button" onClick={() => setOpen(!open)} aria-expanded={open}>
+          <span><small>{TYPE_LABELS[item.type] || item.type}</small><strong>{item.title || "Untitled item"}</strong></span>
+          <span className="tag-preview">{item.tags.slice(0, 2).map((tag) => <i key={tag}>#{tag}</i>)}</span>
+        </button>
+        <span className="item-order-buttons" aria-label={`Reorder ${item.title}`}>
+          <button disabled={!canMoveUp} onClick={() => moveItem(item.id, -1)} aria-label={`Move ${item.title} up`}>↑</button>
+          <button disabled={!canMoveDown} onClick={() => moveItem(item.id, 1)} aria-label={`Move ${item.title} down`}>↓</button>
+        </span>
+        <select className={`status-select ${item.status}`} value={item.status} onChange={(event) => updateItem(item.id, { status: event.target.value })} aria-label={`Status for ${item.title}`}>
+          {STATUSES.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}
+        </select>
+        <button className="expand-button" onClick={() => setOpen(!open)} aria-label={open ? "Collapse item" : "Expand item"}>{open ? "⌃" : "⌄"}</button>
+      </div>
+      {open && (
+        <div className="item-form">
+          <div className="form-grid three">
+            <label>Title<input value={item.title} onChange={(event) => updateItem(item.id, { title: event.target.value })} /></label>
+            <label>Type<select value={item.type} onChange={(event) => updateItem(item.id, { type: event.target.value })}>{Object.entries(TYPE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+            <label>Priority<select value={item.priority} onChange={(event) => updateItem(item.id, { priority: event.target.value })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+          </div>
+          <label>Tags<input value={tagInput} onChange={(event) => {
+            const value = event.target.value;
+            setTagInput(value);
+            updateItem(item.id, { tags: value.split(",").map((tag) => tag.trim()).filter(Boolean) });
+          }} placeholder="must-review, architecture, leadership" /></label>
+          {item.type === "translation" && (
+            <div className="translation-grid">
+              <label>Scheduling Machine pattern<textarea value={item.content.schedulingMachinePattern || ""} onChange={(event) => setContent("schedulingMachinePattern", event.target.value)} /></label>
+              <label>Analogous Tempus problem<textarea value={item.content.tempusProblem || ""} onChange={(event) => setContent("tempusProblem", event.target.value)} /></label>
+              <label>What I would bring<textarea value={item.content.whatIBring || ""} onChange={(event) => setContent("whatIBring", event.target.value)} /></label>
+            </div>
+          )}
+          {item.type === "research" && (
+            <div className="form-grid three">
+              <label>Source title<input value={item.content.sourceTitle || ""} onChange={(event) => setContent("sourceTitle", event.target.value)} /></label>
+              <label>Source URL<input type="url" value={item.content.sourceUrl || ""} onChange={(event) => setContent("sourceUrl", event.target.value)} /></label>
+              <label>Claim type<select value={item.content.claimType || "fact"} onChange={(event) => setContent("claimType", event.target.value)}><option value="fact">Fact</option><option value="inference">Inference</option><option value="hypothesis">Hypothesis</option></select></label>
+            </div>
+          )}
+          <label>Notes / prepared answer<textarea className="main-textarea" value={item.content.notes || ""} onChange={(event) => setContent("notes", event.target.value)} placeholder="Capture the answer, evidence, trade-offs, and details you need on recall…" /></label>
+          <section className="item-images">
+            <div className="item-images-heading"><span>Images</span><small>.jpg, .jpeg, .png, .gif, .svg, .heic · 12 MB maximum each</small></div>
+            {(item.images || []).length > 0 && <div className="image-preview-grid">
+              {(item.images || []).map((image) => (
+                <figure key={image.id}>
+                  <button type="button" className="image-preview-frame" onClick={() => setPreviewImage(image)} aria-label={`Preview ${image.filename}`}>
+                    <img src={image.url} alt={image.filename} onError={(event) => {
+                      event.currentTarget.hidden = true;
+                      event.currentTarget.nextElementSibling.hidden = false;
+                    }} />
+                    <span className="image-preview-fallback" hidden>Preview unavailable for this format</span>
+                    <span className="image-preview-hint">View</span>
+                  </button>
+                  <figcaption title={image.filename}>{image.filename}</figcaption>
+                  <button className="danger-link" onClick={() => removeImageFromItem(item.id, image)}>Delete image</button>
+                </figure>
+              ))}
+            </div>}
+            <label className="image-upload-label">＋ Add images
+              <input type="file" accept=".jpg,.jpeg,.png,.gif,.svg,.heic,image/jpeg,image/png,image/gif,image/svg+xml,image/heic" multiple onChange={(event) => {
+                addImagesToItem(item.id, event.target.files);
+                event.target.value = "";
+              }} />
+            </label>
+          </section>
+          <div className="item-actions">
+            <span>Updated {new Date(item.updatedAt).toLocaleString()}</span>
+            <button className="save-link" onClick={() => saveNow()}>Save</button>
+            <button className="danger-link" onClick={() => deleteItem(item.id)}>Delete</button>
+            <button onClick={() => duplicateItem(item)}>Duplicate</button>
+          </div>
+        </div>
+      )}
+      {previewImage && (
+        <div className="image-lightbox-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPreviewImage(null)}>
+          <section className="image-lightbox" role="dialog" aria-modal="true" aria-label={`Image preview: ${previewImage.filename}`}>
+            <button type="button" className="image-lightbox-close" onClick={() => setPreviewImage(null)} aria-label="Close image preview">×</button>
+            <div className="image-lightbox-canvas">
+              <img src={previewImage.url} alt={previewImage.filename} />
+            </div>
+            <footer>
+              <span title={previewImage.filename}>{previewImage.filename}</span>
+              <a href={previewImage.url} target="_blank" rel="noreferrer">Open original ↗</a>
+            </footer>
+          </section>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function DrillSection({ module, trees, updateTree, addTree, deleteTree }) {
+  const [practiceTree, setPracticeTree] = useState(null);
+  return (
+    <section className="drill-section">
+      <div className="section-heading"><div><p className="eyebrow">Progressive drilling</p><h2>Follow-up depth</h2></div><button className="primary-button" onClick={() => addTree(module.id)}>＋ Add drill tree</button></div>
+      {trees.length === 0 ? <p className="muted">No drill trees are assigned to this module yet.</p> : trees.map((tree) => (
+        <article className="drill-card" key={tree.id}>
+          <div className="drill-heading">
+            <div><small>{tree.nodes.length} levels</small><input className="drill-title-input" value={tree.title} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, title: event.target.value }))} aria-label="Drill tree title" /></div>
+            <div className="drill-actions"><button className="danger-link" onClick={() => deleteTree(tree.id)}>Delete</button><button className="secondary-button" onClick={() => setPracticeTree(tree)}>Practice tree →</button></div>
+          </div>
+          <div className="drill-nodes">
+            {tree.nodes.map((node, index) => (
+              <div className="drill-node" key={node.id} style={{ marginLeft: `${node.level * 28}px` }}>
+                <span className="level-badge">L{node.level}</span>
+                <label><span className="visually-hidden">Question level {node.level}</span><input value={node.question} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, question: event.target.value } : entry) }))} /></label>
+                <select value={node.status} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, status: event.target.value } : entry) }))} aria-label={`Status for level ${index}`}>
+                  {STATUSES.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+          <button className="add-followup" onClick={() => updateTree(tree.id, (current) => ({
+            ...current,
+            nodes: [...current.nodes, {
+              id: createId(),
+              parentId: current.nodes.at(-1)?.id ?? null,
+              level: current.nodes.length,
+              question: "New follow-up question",
+              myAnswer: "",
+              status: "not-started",
+              sortOrder: current.nodes.length,
+            }],
+          }))}>＋ Add follow-up level</button>
+        </article>
+      ))}
+      {practiceTree && <PracticeDialog tree={practiceTree} close={() => setPracticeTree(null)} updateTree={updateTree} />}
+    </section>
+  );
+}
+
+function PracticeDialog({ tree, close, updateTree }) {
+  const [revealed, setRevealed] = useState(0);
+  const visible = tree.nodes.slice(0, revealed + 1);
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <section className="practice-dialog" role="dialog" aria-modal="true" aria-labelledby="practice-title">
+        <button className="dialog-close" onClick={close} aria-label="Close practice mode">×</button>
+        <p className="eyebrow">Mock interview · Level {revealed} of {tree.nodes.length - 1}</p>
+        <h2 id="practice-title">{tree.title}</h2>
+        {visible.map((node) => (
+          <div className="practice-question" key={node.id}>
+            <small>{node.level === 0 ? "Root question" : `Follow-up ${node.level}`}</small>
+            <h3>{node.question}</h3>
+            <textarea value={node.myAnswer} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: event.target.value } : entry) }))} placeholder="Practice your answer here…" />
+          </div>
+        ))}
+        <div className="dialog-actions">
+          <button className="secondary-button" onClick={close}>Finish</button>
+          {revealed < tree.nodes.length - 1 && <button className="primary-button" onClick={() => setRevealed((value) => value + 1)}>Reveal next follow-up</button>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SearchResults({ query, results, modules, onNavigate }) {
+  return (
+    <main className="page">
+      <section className="simple-header"><p className="eyebrow">Global search</p><h1>Results for “{query}”</h1><p>{results.length} matching item{results.length === 1 ? "" : "s"}</p></section>
+      <div className="search-results">
+        {results.length === 0 && <div className="empty-state"><strong>No matches yet</strong><p>Try a title, phrase, tag, question, or acronym.</p></div>}
+        {results.map((result) => {
+          const module = modules.find((entry) => entry.id === result.module);
+          return <button key={result.id} onClick={() => onNavigate(result.module)}><span className="module-dot" style={{ background: module?.color }}>{module?.short}</span><span><small>{module?.label} · {result.kind}</small><strong>{result.title}</strong></span><span>→</span></button>;
+        })}
+      </div>
+    </main>
+  );
+}
+
+function QuickReview({ data, modules, updateItem, updateTree, saveNow, onNavigate }) {
+  const starredItems = data.items.filter((item) => item.starred);
+  const starredTrees = data.drillTrees.filter((tree) => tree.starred);
+  return (
+    <main className="page quick-review-page">
+      <section className="simple-header print-header"><p className="eyebrow">Day-of mode</p><h1>Quick review</h1><p>Your starred, highest-priority preparation in one calm view.</p><button className="primary-button no-print" onClick={() => window.print()}>Print / Save PDF</button></section>
+      {modules.map((module) => {
+        const items = starredItems.filter((item) => item.module === module.id);
+        const trees = starredTrees.filter((tree) => tree.module === module.id);
+        if (!items.length && !trees.length) return null;
+        return (
+          <section className="review-module" key={module.id}>
+            <div className="review-module-heading"><span className="module-dot" style={{ background: module.color }}>{module.short}</span><h2>{module.label}</h2><button className="text-button no-print" onClick={() => onNavigate(module.id)}>Open module →</button></div>
+            {items.map((item) => (
+              <article className="review-item" key={item.id}>
+                <small>{TYPE_LABELS[item.type] || item.type}</small><h3>{item.title}</h3>
+                {item.type === "translation" ? <div className="review-columns"><p><b>Pattern</b>{item.content.schedulingMachinePattern}</p><p><b>Tempus problem</b>{item.content.tempusProblem}</p><p><b>What I bring</b>{item.content.whatIBring}</p></div> : <p>{item.content.notes || "No notes added yet."}</p>}
+                <label className="quick-review-notes no-print">Notes / prepared answer
+                  <textarea value={item.content.quickReviewNotes || ""} onChange={(event) => updateItem(item.id, { content: { ...item.content, quickReviewNotes: event.target.value } })} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
+                </label>
+                <button className="quick-review-save no-print" onClick={() => saveNow()}>Save notes</button>
+              </article>
+            ))}
+            {trees.map((tree) => (
+              <article className="review-item" key={tree.id}>
+                <small>Drill tree</small><h3>{tree.title}</h3><ol>{tree.nodes.map((node) => <li key={node.id}><b>{node.question}</b>{node.myAnswer && <p>{node.myAnswer}</p>}</li>)}</ol>
+                <label className="quick-review-notes no-print">Notes / prepared answer
+                  <textarea value={tree.quickReviewNotes || ""} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, quickReviewNotes: event.target.value }))} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
+                </label>
+                <button className="quick-review-save no-print" onClick={() => saveNow()}>Save notes</button>
+              </article>
+            ))}
+          </section>
+        );
+      })}
+    </main>
+  );
+}
+
+const CUSTOM_MODULE_COLORS = ["#4f7b68", "#7b6455", "#65759a", "#8a647d", "#5c7b80", "#85733f"];
+
+function Settings({ data, setData, exportData, importData, resetData, deletePreparationSection, reorderPreparationSections }) {
+  const updateSettings = (patch) => setData((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
+  const [sectionDrafts, setSectionDrafts] = useState(() => data.settings.preparationModules || []);
+  const addSectionDraft = () => {
+    setSectionDrafts((current) => [...current, {
+      id: `custom-${createId()}`,
+      label: "",
+      short: "",
+      color: CUSTOM_MODULE_COLORS[current.length % CUSTOM_MODULE_COLORS.length],
+      description: "",
+    }]);
+  };
+  const updateSectionDraft = (id, patch) => setSectionDrafts((current) => current.map((section) => section.id === id ? { ...section, ...patch } : section));
+  const saveSectionDraft = async (draft) => {
+    const label = draft.label.trim();
+    if (!label) {
+      window.alert("Enter a name for the preparation section before saving.");
+      return;
+    }
+    const normalized = {
+      ...draft,
+      label,
+      short: (draft.short || "").trim() || label.split(/\s+/).map((word) => word[0]).join("").slice(0, 2).toUpperCase(),
+      description: draft.description.trim() || `Prepare and organize material for ${label}.`,
+    };
+    const savedIds = new Set((data.settings.preparationModules || []).map((section) => section.id));
+    const nextDrafts = sectionDrafts.map((section) => section.id === draft.id ? normalized : section);
+    const nextModules = nextDrafts.filter((section) => savedIds.has(section.id) || section.id === draft.id);
+    if (await reorderPreparationSections(nextModules)) setSectionDrafts(nextDrafts);
+  };
+  const deleteSectionDraft = async (draft) => {
+    const isSaved = (data.settings.preparationModules || []).some((section) => section.id === draft.id);
+    if (isSaved && !await deletePreparationSection(draft.id)) return;
+    setSectionDrafts((current) => current.filter((section) => section.id !== draft.id));
+  };
+  const moveSectionDraft = async (index, direction) => {
+    const target = index + direction;
+    if (target < 0 || target >= sectionDrafts.length) return;
+    const nextDrafts = [...sectionDrafts];
+    [nextDrafts[index], nextDrafts[target]] = [nextDrafts[target], nextDrafts[index]];
+    setSectionDrafts(nextDrafts);
+    const savedIds = new Set((data.settings.preparationModules || []).map((section) => section.id));
+    await reorderPreparationSections(nextDrafts.filter((section) => savedIds.has(section.id)));
+  };
+  return (
+    <main className="page settings-page">
+      <section className="simple-header"><p className="eyebrow">Workspace setup</p><h1>Settings & backup</h1><p>Keep interview details current and protect your local preparation data.</p></section>
+      <section className="settings-panel panel">
+        <h2>Interview details</h2>
+        <div className="form-grid two">
+          <label>Company<input value={data.settings.companyName} onChange={(event) => updateSettings({ companyName: event.target.value })} /></label>
+          <label>Role title<input value={data.settings.roleTitle} onChange={(event) => updateSettings({ roleTitle: event.target.value })} placeholder="Product Manager, Data Platform" /></label>
+          <label>Interview stage<input value={data.settings.interviewStage} onChange={(event) => updateSettings({ interviewStage: event.target.value })} /></label>
+          <label>Interview date<input type="datetime-local" value={data.settings.interviewDate} onChange={(event) => updateSettings({ interviewDate: event.target.value })} /></label>
+        </div>
+        <label className="settings-wide-label">Interviewer / panel names
+          <input
+            value={(data.settings.interviewers || []).map((person) => person.name).join(", ")}
+            onChange={(event) => updateSettings({
+              interviewers: event.target.value.split(",").map((name) => name.trim()).filter(Boolean).map((name, index) => ({
+                id: data.settings.interviewers?.[index]?.id || createId(),
+                name,
+                title: data.settings.interviewers?.[index]?.title || "",
+                notes: data.settings.interviewers?.[index]?.notes || "",
+              })),
+            })}
+            placeholder="Alex Rivera, Morgan Lee"
+          />
+        </label>
+      </section>
+      <section className="settings-panel panel preparation-settings">
+        <div className="settings-section-heading">
+          <div><h2>Add new preparation</h2><p>Create, edit, and reorder every preparation section shown in the sidebar and preparation map.</p></div>
+        </div>
+        <div className="preparation-draft-list">
+          {sectionDrafts.length === 0 && <p className="muted">No custom preparation sections yet. Use the plus button to add one.</p>}
+          {sectionDrafts.map((draft) => {
+            const isSaved = (data.settings.preparationModules || []).some((section) => section.id === draft.id);
+            return (
+              <article className="preparation-draft" key={draft.id}>
+                <span className="module-dot large" style={{ background: draft.color }}>{draft.short || "+"}</span>
+                <div className="preparation-draft-fields">
+                  <label>Section name<input value={draft.label} onChange={(event) => updateSectionDraft(draft.id, { label: event.target.value })} placeholder="Leadership stories" /></label>
+                  <label>Description<input value={draft.description} onChange={(event) => updateSectionDraft(draft.id, { description: event.target.value })} placeholder="What you want to prepare in this section" /></label>
+                </div>
+                <div className="preparation-draft-actions">
+                  <small>{isSaved ? "Saved entry" : "New entry"}</small>
+                  <span className="preparation-order-buttons">
+                    <button disabled={sectionDrafts.indexOf(draft) === 0} onClick={() => moveSectionDraft(sectionDrafts.indexOf(draft), -1)} aria-label={`Move ${draft.label || "new section"} up`}>↑</button>
+                    <button disabled={sectionDrafts.indexOf(draft) === sectionDrafts.length - 1} onClick={() => moveSectionDraft(sectionDrafts.indexOf(draft), 1)} aria-label={`Move ${draft.label || "new section"} down`}>↓</button>
+                  </span>
+                  <button className="save-link" onClick={() => saveSectionDraft(draft)}>Save</button>
+                  <button className="danger-link" onClick={() => deleteSectionDraft(draft)}>Delete</button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+        <button className="add-preparation-button" onClick={addSectionDraft}><span>＋</span>Add another preparation section</button>
+      </section>
+      <section className="settings-panel panel">
+        <h2>Local data</h2><p>This dashboard stores data in a local SQLite database on this laptop. Export a backup regularly.</p>
+        <div className="button-row"><button className="primary-button" onClick={exportData}>Export JSON backup</button><button className="secondary-button" onClick={importData}>Import JSON backup</button><button className="danger-button" onClick={resetData}>Reset dashboard</button></div>
+        <small>Schema version {SCHEMA_VERSION} · {data.items.length} items · {data.drillTrees.length} drill tree{data.drillTrees.length === 1 ? "" : "s"}</small>
+      </section>
+    </main>
+  );
+}
+
+function EmptyState({ onAdd }) {
+  return <div className="empty-state"><strong>No preparation items yet</strong><p>Add the first item for this module.</p><button className="primary-button" onClick={onAdd}>Add item</button></div>;
+}
+
+function countdown(value) {
+  if (!value) return null;
+  const target = new Date(value).getTime();
+  if (Number.isNaN(target)) return null;
+  return Math.ceil((target - Date.now()) / 86400000);
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Date not set";
+  return date.toLocaleString([], { month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+export default App;

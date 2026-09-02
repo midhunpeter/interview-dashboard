@@ -12,6 +12,7 @@ import {
   uploadItemImage,
   deleteItemImage,
 } from "./data";
+import { FormattedTextarea, MarkdownContent } from "./markdown";
 
 const TYPE_LABELS = {
   note: "Note",
@@ -24,6 +25,62 @@ const TYPE_LABELS = {
   research: "Research",
   "open-question": "Open question",
 };
+
+const isSchedulingOverview = (item) => item.module === "scheduling-machine"
+  && item.title === "Platform overview and scale"
+  && item.type === "note";
+
+function itemMarkdownSections(item) {
+  const content = item.content || {};
+  if (item.type === "story") return [
+    ["Situation", content.situation],
+    ["Task", content.task],
+    ["Action", content.action ?? content.notes],
+    ["Result", content.result],
+  ];
+  if (item.type === "incident") return [
+    ["What broke", content.whatBroke ?? content.notes],
+    ["How it was found", content.howFound],
+    ["How it was fixed", content.howFixed],
+    ["What changed afterward", content.whatChangedAfter],
+  ];
+  if (item.type === "translation") return [
+    ["Scheduling Machine pattern", content.schedulingMachinePattern],
+    ["Analogous Tempus problem", content.tempusProblem],
+    ["What I would bring", content.whatIBring],
+  ];
+  if (item.type === "knowledge") return [
+    ["Definition", content.definition ?? content.notes],
+    ["Notes", content.definition == null ? "" : content.notes],
+  ];
+  if (isSchedulingOverview(item)) return [
+    ["Overview", content.overview ?? content.notes],
+    ...(content.architectureNotes || []).map((value, index) => [`Architecture note ${index + 1}`, value]),
+    ...(content.ownershipStories || []).map((value, index) => [`Ownership story ${index + 1}`, value]),
+    ["Scale metrics", content.scaleMetrics],
+    ["Lessons learned", content.lessonsLearned],
+  ];
+  return [[null, content.notes]];
+}
+
+function primaryItemMarkdown(item) {
+  return itemMarkdownSections(item).find(([, value]) => String(value || "").trim())?.[1] || "";
+}
+
+function ItemMarkdownContent({ item, emptyText = "No notes added yet." }) {
+  const sections = itemMarkdownSections(item).filter(([, value]) => String(value || "").trim());
+  if (!sections.length) return <p className="markdown-empty">{emptyText}</p>;
+  return (
+    <div className={`markdown-sections ${sections.length > 1 ? "multiple" : ""}`}>
+      {sections.map(([label, value], index) => (
+        <section key={`${label || "notes"}-${index}`}>
+          {label && <b>{label}</b>}
+          <MarkdownContent value={value} />
+        </section>
+      ))}
+    </div>
+  );
+}
 
 const makeItem = (moduleId) => {
   const timestamp = new Date().toISOString();
@@ -483,7 +540,7 @@ function Dashboard({ data, modules, onNavigate }) {
               return (
                 <button key={item.id} onClick={() => onNavigate(item.module)}>
                   <span className="module-dot" style={{ background: module?.color }}>{module?.short}</span>
-                  <span><strong>{item.title}</strong><small>{module?.label} · {item.status.replace("-", " ")}</small></span>
+                  <div className="focus-copy"><strong>{item.title}</strong><small>{module?.label} · {item.status.replace("-", " ")}</small><MarkdownContent value={primaryItemMarkdown(item)} className="focus-snippet" /></div>
                   <span aria-hidden="true">→</span>
                 </button>
               );
@@ -538,6 +595,66 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
   );
 }
 
+function FormattedListEditor({ label, values = [], onChange, addLabel }) {
+  const updateEntry = (index, value) => onChange(values.map((entry, entryIndex) => entryIndex === index ? value : entry));
+  const removeEntry = (index) => onChange(values.filter((_, entryIndex) => entryIndex !== index));
+  return (
+    <section className="formatted-list-editor">
+      <span className="formatted-field-label">{label}</span>
+      {values.map((value, index) => (
+        <div className="formatted-list-entry" key={`${label}-${index}`}>
+          <FormattedTextarea label={`${label} ${index + 1}`} value={value} onChange={(nextValue) => updateEntry(index, nextValue)} />
+          <button type="button" className="danger-link" onClick={() => removeEntry(index)}>Remove</button>
+        </div>
+      ))}
+      <button type="button" className="add-formatted-entry" onClick={() => onChange([...values, ""])}>＋ {addLabel}</button>
+    </section>
+  );
+}
+
+function ItemLongTextFields({ item, setContent }) {
+  const content = item.content || {};
+  if (item.type === "story") return (
+    <div className="long-text-stack">
+      <FormattedTextarea label="Situation" value={content.situation || ""} onChange={(value) => setContent("situation", value)} />
+      <FormattedTextarea label="Task" value={content.task || ""} onChange={(value) => setContent("task", value)} />
+      <FormattedTextarea label="Action" value={content.action ?? content.notes ?? ""} onChange={(value) => setContent("action", value)} />
+      <FormattedTextarea label="Result" value={content.result || ""} onChange={(value) => setContent("result", value)} />
+    </div>
+  );
+  if (item.type === "incident") return (
+    <div className="long-text-stack">
+      <FormattedTextarea label="What broke" value={content.whatBroke ?? content.notes ?? ""} onChange={(value) => setContent("whatBroke", value)} />
+      <FormattedTextarea label="How it was found" value={content.howFound || ""} onChange={(value) => setContent("howFound", value)} />
+      <FormattedTextarea label="How it was fixed" value={content.howFixed || ""} onChange={(value) => setContent("howFixed", value)} />
+      <FormattedTextarea label="What changed afterward" value={content.whatChangedAfter || ""} onChange={(value) => setContent("whatChangedAfter", value)} />
+    </div>
+  );
+  if (item.type === "translation") return (
+    <div className="translation-grid formatted-translation-grid">
+      <FormattedTextarea label="Scheduling Machine pattern" value={content.schedulingMachinePattern || ""} onChange={(value) => setContent("schedulingMachinePattern", value)} />
+      <FormattedTextarea label="Analogous Tempus problem" value={content.tempusProblem || ""} onChange={(value) => setContent("tempusProblem", value)} />
+      <FormattedTextarea label="What I would bring" value={content.whatIBring || ""} onChange={(value) => setContent("whatIBring", value)} />
+    </div>
+  );
+  if (item.type === "knowledge") return (
+    <div className="long-text-stack">
+      <FormattedTextarea label="Definition" value={content.definition ?? content.notes ?? ""} onChange={(value) => setContent("definition", value)} />
+      <FormattedTextarea label="Notes" value={content.definition == null ? "" : content.notes || ""} onChange={(value) => setContent("notes", value)} />
+    </div>
+  );
+  if (isSchedulingOverview(item)) return (
+    <div className="long-text-stack">
+      <FormattedTextarea label="Overview" value={content.overview ?? content.notes ?? ""} onChange={(value) => setContent("overview", value)} textareaClassName="main-textarea" />
+      <FormattedListEditor label="Architecture note" values={content.architectureNotes || []} onChange={(value) => setContent("architectureNotes", value)} addLabel="Add architecture note" />
+      <FormattedListEditor label="Ownership story" values={content.ownershipStories || []} onChange={(value) => setContent("ownershipStories", value)} addLabel="Add ownership story" />
+      <FormattedTextarea label="Scale metrics" value={content.scaleMetrics || ""} onChange={(value) => setContent("scaleMetrics", value)} />
+      <FormattedTextarea label="Lessons learned" value={content.lessonsLearned || ""} onChange={(value) => setContent("lessonsLearned", value)} />
+    </div>
+  );
+  return <FormattedTextarea label="Notes / prepared answer" value={content.notes || ""} onChange={(value) => setContent("notes", value)} textareaClassName="main-textarea" placeholder="Capture the answer, evidence, trade-offs, and details you need on recall…" />;
+}
+
 function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown, deleteItem, duplicateItem, saveNow, addImagesToItem, removeImageFromItem }) {
   const [open, setOpen] = useState(item.title === "Untitled prep item");
   const [tagInput, setTagInput] = useState(() => (item.tags || []).join(", "));
@@ -583,13 +700,6 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
             setTagInput(value);
             updateItem(item.id, { tags: value.split(",").map((tag) => tag.trim()).filter(Boolean) });
           }} placeholder="must-review, architecture, leadership" /></label>
-          {item.type === "translation" && (
-            <div className="translation-grid">
-              <label>Scheduling Machine pattern<textarea value={item.content.schedulingMachinePattern || ""} onChange={(event) => setContent("schedulingMachinePattern", event.target.value)} /></label>
-              <label>Analogous Tempus problem<textarea value={item.content.tempusProblem || ""} onChange={(event) => setContent("tempusProblem", event.target.value)} /></label>
-              <label>What I would bring<textarea value={item.content.whatIBring || ""} onChange={(event) => setContent("whatIBring", event.target.value)} /></label>
-            </div>
-          )}
           {item.type === "research" && (
             <div className="form-grid three">
               <label>Source title<input value={item.content.sourceTitle || ""} onChange={(event) => setContent("sourceTitle", event.target.value)} /></label>
@@ -597,7 +707,7 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
               <label>Claim type<select value={item.content.claimType || "fact"} onChange={(event) => setContent("claimType", event.target.value)}><option value="fact">Fact</option><option value="inference">Inference</option><option value="hypothesis">Hypothesis</option></select></label>
             </div>
           )}
-          <label>Notes / prepared answer<textarea className="main-textarea" value={item.content.notes || ""} onChange={(event) => setContent("notes", event.target.value)} placeholder="Capture the answer, evidence, trade-offs, and details you need on recall…" /></label>
+          <ItemLongTextFields item={item} setContent={setContent} />
           <section className="item-images">
             <div className="item-images-heading"><span>Images</span><small>.jpg, .jpeg, .png, .gif, .svg, .heic · 12 MB maximum each</small></div>
             {(item.images || []).length > 0 && <div className="image-preview-grid">
@@ -703,7 +813,7 @@ function PracticeDialog({ tree, close, updateTree }) {
           <div className="practice-question" key={node.id}>
             <small>{node.level === 0 ? "Root question" : `Follow-up ${node.level}`}</small>
             <h3>{node.question}</h3>
-            <textarea value={node.myAnswer} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: event.target.value } : entry) }))} placeholder="Practice your answer here…" />
+            <FormattedTextarea value={node.myAnswer} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: value } : entry) }))} placeholder="Practice your answer here…" ariaLabel={`Answer for ${node.question}`} />
           </div>
         ))}
         <div className="dialog-actions">
@@ -746,19 +856,17 @@ function QuickReview({ data, modules, updateItem, updateTree, saveNow, onNavigat
             {items.map((item) => (
               <article className="review-item" key={item.id}>
                 <small>{TYPE_LABELS[item.type] || item.type}</small><h3>{item.title}</h3>
-                {item.type === "translation" ? <div className="review-columns"><p><b>Pattern</b>{item.content.schedulingMachinePattern}</p><p><b>Tempus problem</b>{item.content.tempusProblem}</p><p><b>What I bring</b>{item.content.whatIBring}</p></div> : <p>{item.content.notes || "No notes added yet."}</p>}
-                <label className="quick-review-notes no-print">Notes / prepared answer
-                  <textarea value={item.content.quickReviewNotes || ""} onChange={(event) => updateItem(item.id, { content: { ...item.content, quickReviewNotes: event.target.value } })} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
-                </label>
+                <ItemMarkdownContent item={item} />
+                <FormattedTextarea className="quick-review-notes no-print" label="Notes / prepared answer" value={item.content.quickReviewNotes || ""} onChange={(value) => updateItem(item.id, { content: { ...item.content, quickReviewNotes: value } })} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
+                <div className="quick-review-print-notes print-only"><b>Notes / prepared answer</b><MarkdownContent value={item.content.quickReviewNotes || ""} /></div>
                 <button className="quick-review-save no-print" onClick={() => saveNow()}>Save notes</button>
               </article>
             ))}
             {trees.map((tree) => (
               <article className="review-item" key={tree.id}>
-                <small>Drill tree</small><h3>{tree.title}</h3><ol>{tree.nodes.map((node) => <li key={node.id}><b>{node.question}</b>{node.myAnswer && <p>{node.myAnswer}</p>}</li>)}</ol>
-                <label className="quick-review-notes no-print">Notes / prepared answer
-                  <textarea value={tree.quickReviewNotes || ""} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, quickReviewNotes: event.target.value }))} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
-                </label>
+                <small>Drill tree</small><h3>{tree.title}</h3><ol>{tree.nodes.map((node) => <li key={node.id}><b>{node.question}</b>{node.myAnswer && <MarkdownContent value={node.myAnswer} />}</li>)}</ol>
+                <FormattedTextarea className="quick-review-notes no-print" label="Notes / prepared answer" value={tree.quickReviewNotes || ""} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, quickReviewNotes: value }))} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
+                <div className="quick-review-print-notes print-only"><b>Notes / prepared answer</b><MarkdownContent value={tree.quickReviewNotes || ""} /></div>
                 <button className="quick-review-save no-print" onClick={() => saveNow()}>Save notes</button>
               </article>
             ))}

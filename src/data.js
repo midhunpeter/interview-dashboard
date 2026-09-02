@@ -105,23 +105,27 @@ async function api(path, options = {}) {
 }
 
 const timestamp = () => new Date().toISOString();
-const baseItem = (resource, row, fields) => ({
-  id: `${resource}:${row.id}`,
-  type: "note",
-  module: "positioning",
-  title: "Untitled prep item",
-  tags: [],
-  status: "not-started",
-  priority: "medium",
-  starred: false,
-  sortOrder: row.id,
-  createdAt: timestamp(),
-  updatedAt: timestamp(),
-  content: { notes: "" },
-  ...fields,
-  ...(row._ui || {}),
-  id: `${resource}:${row.id}`,
-});
+const baseItem = (resource, row, fields) => {
+  const ui = row._ui || {};
+  return {
+    id: `${resource}:${row.id}`,
+    type: "note",
+    module: "positioning",
+    title: "Untitled prep item",
+    tags: [],
+    status: "not-started",
+    priority: "medium",
+    starred: false,
+    sortOrder: row.id,
+    createdAt: timestamp(),
+    updatedAt: timestamp(),
+    content: { notes: "" },
+    ...fields,
+    ...ui,
+    content: { ...(ui.content || {}), ...(fields.content || { notes: "" }) },
+    id: `${resource}:${row.id}`,
+  };
+};
 
 function rememberItem(item, resource, dbId) {
   itemIdentities.set(item.id, { resource, dbId });
@@ -136,7 +140,12 @@ function rowsToItems({ stories, questions, scheduling, incidents, translations, 
       title: row.title || "Untitled story",
       tags: row.tags || [],
       status: row.status || "not-started",
-      content: { notes: row.action || "" },
+      content: {
+        situation: row.situation || "",
+        task: row.task || "",
+        action: row.action || "",
+        result: row.result || "",
+      },
     }), "story-bank", row.id)),
     ...questions.map((row) => rememberItem(baseItem("question-bank", row, {
       type: "question",
@@ -150,7 +159,12 @@ function rowsToItems({ stories, questions, scheduling, incidents, translations, 
       module: "platform-reliability",
       title: row.title || "Untitled incident",
       tags: row.tags || [],
-      content: { notes: row.what_broke || "" },
+      content: {
+        whatBroke: row.what_broke || "",
+        howFound: row.how_found || "",
+        howFixed: row.how_fixed || "",
+        whatChangedAfter: row.what_changed_after || "",
+      },
     }), "reliability-incidents", row.id)),
     ...translations.map((row) => rememberItem(baseItem("translation-map", row, {
       type: "translation",
@@ -168,26 +182,23 @@ function rowsToItems({ stories, questions, scheduling, incidents, translations, 
       module: row.module || "positioning",
       title: row.term || "Untitled knowledge item",
       tags: row.tags || [],
-      content: { notes: row.definition || row.notes || "" },
+      content: { definition: row.definition || "", notes: row.notes || "" },
     }), "knowledge-items", row.id)),
   ];
 
-  const schedulingHasContent = [
-    scheduling.overview,
-    ...(scheduling.architecture_notes || []),
-    ...(scheduling.ownership_stories || []),
-    scheduling.scale_metrics,
-    scheduling.lessons_learned,
-  ].some((value) => typeof value === "string" && value.trim());
-  if (schedulingHasContent) {
-    items.push(rememberItem(baseItem("scheduling-machine", scheduling, {
-      module: "scheduling-machine",
-      title: "Platform overview and scale",
-      priority: "high",
-      starred: true,
-      content: { notes: scheduling.overview || "" },
-    }), "scheduling-machine", 1));
-  }
+  items.push(rememberItem(baseItem("scheduling-machine", scheduling, {
+    module: "scheduling-machine",
+    title: "Platform overview and scale",
+    priority: "high",
+    starred: true,
+    content: {
+      overview: scheduling.overview || "",
+      architectureNotes: scheduling.architecture_notes || [],
+      ownershipStories: scheduling.ownership_stories || [],
+      scaleMetrics: scheduling.scale_metrics || "",
+      lessonsLearned: scheduling.lessons_learned || "",
+    },
+  }), "scheduling-machine", 1));
   const imagesByOwner = images.reduce((map, image) => {
     const key = `${image.resource}:${image.record_id}`;
     map.set(key, [...(map.get(key) || []), image]);
@@ -275,7 +286,16 @@ async function loadDatabaseData() {
     drillTrees: trees.map(rowToTree),
   };
 
-  if (!data.items.length && !data.drillTrees.length) {
+  const schedulingHasContent = [
+    scheduling.overview,
+    ...(scheduling.architecture_notes || []),
+    ...(scheduling.ownership_stories || []),
+    scheduling.scale_metrics,
+    scheduling.lessons_learned,
+  ].some((value) => typeof value === "string" && value.trim());
+  const hasStoredPreparation = stories.length || questions.length || trees.length || incidents.length
+    || translations.length || knowledge.length || schedulingHasContent;
+  if (!hasStoredPreparation) {
     const initial = createInitialData();
     await saveData(initial);
     return initial;
@@ -312,17 +332,50 @@ function itemPayload(item, resource) {
     updatedAt: item.updatedAt,
     content: item.content || { notes: "" },
   };
-  if (resource === "story-bank") return { module: item.module, title: item.title, tags: item.tags || [], action: notes, used_for: [], status: item.status, _ui };
+  if (resource === "story-bank") return {
+    module: item.module,
+    title: item.title,
+    tags: item.tags || [],
+    situation: item.content?.situation || "",
+    task: item.content?.task || "",
+    action: item.content?.action ?? notes,
+    result: item.content?.result || "",
+    used_for: [],
+    status: item.status,
+    _ui,
+  };
   if (resource === "question-bank") return { module: item.module, sub_topic: item.title, question: item.title, my_answer: notes, status: item.status, _ui };
-  if (resource === "reliability-incidents") return { title: item.title, what_broke: notes, tags: item.tags || [], _ui };
+  if (resource === "reliability-incidents") return {
+    title: item.title,
+    what_broke: item.content?.whatBroke ?? notes,
+    how_found: item.content?.howFound || "",
+    how_fixed: item.content?.howFixed || "",
+    what_changed_after: item.content?.whatChangedAfter || "",
+    tags: item.tags || [],
+    _ui,
+  };
   if (resource === "translation-map") return {
     scheduling_machine_pattern: item.content?.schedulingMachinePattern || "",
     tempus_problem: item.content?.tempusProblem || "",
     what_i_bring: item.content?.whatIBring || "",
     _ui,
   };
-  if (resource === "scheduling-machine") return { overview: notes, _ui };
-  return { module: item.module, term: item.title, definition: notes, notes: "", tags: item.tags || [], _ui };
+  if (resource === "scheduling-machine") return {
+    overview: item.content?.overview ?? notes,
+    architecture_notes: item.content?.architectureNotes || [],
+    ownership_stories: item.content?.ownershipStories || [],
+    scale_metrics: item.content?.scaleMetrics || "",
+    lessons_learned: item.content?.lessonsLearned || "",
+    _ui,
+  };
+  return {
+    module: item.module,
+    term: item.title,
+    definition: item.content?.definition ?? notes,
+    notes: item.content?.definition == null ? "" : notes,
+    tags: item.tags || [],
+    _ui,
+  };
 }
 
 async function deleteItemResource({ resource, dbId }) {

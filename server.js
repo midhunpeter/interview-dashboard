@@ -21,6 +21,7 @@ const jsonColumns = {
   reliability_incidents: new Set(["tags"]),
   translation_map: new Set(),
   knowledge_items: new Set(["tags"]),
+  interview_rounds: new Set(["interviewers"]),
 };
 
 function parseJson(value) {
@@ -148,6 +149,99 @@ app.put("/api/settings", (req, res) => {
   res.json(withMetadata("settings", "settings", db.prepare("SELECT * FROM settings WHERE id = 1").get()));
 });
 
+const workspaceColumns = ["company_name", "role_title"];
+const roundColumns = ["label", "stage_type", "scheduled_date", "interviewers", "sequence_order", "status", "interviewer_notes", "questions_to_ask", "outcome_notes"];
+
+function serializeRound(row) {
+  return serializeRow("interview_rounds", row);
+}
+
+app.get("/api/workspaces", (_req, res) => {
+  res.json(db.prepare("SELECT id, company_name, role_title, created_at FROM workspaces ORDER BY created_at, id").all());
+});
+
+app.post("/api/workspaces", (req, res) => {
+  const values = sanitizeBody("workspaces", workspaceColumns, req.body || {});
+  const result = db.prepare("INSERT INTO workspaces (company_name, role_title) VALUES (?, ?)")
+    .run(values.company_name || "Untitled company", values.role_title || "");
+  res.status(201).json(db.prepare("SELECT id, company_name, role_title, created_at FROM workspaces WHERE id = ?").get(result.lastInsertRowid));
+});
+
+app.get("/api/workspaces/:id", (req, res) => {
+  const workspace = db.prepare("SELECT id, company_name, role_title, created_at FROM workspaces WHERE id = ?").get(req.params.id);
+  if (!workspace) return sendNotFound(res, "Workspace");
+  return res.json(workspace);
+});
+
+app.put("/api/workspaces/:id", (req, res) => {
+  if (!db.prepare("SELECT id FROM workspaces WHERE id = ?").get(req.params.id)) return sendNotFound(res, "Workspace");
+  const values = sanitizeBody("workspaces", workspaceColumns, req.body || {});
+  const keys = Object.keys(values);
+  if (keys.length) {
+    db.prepare(`UPDATE workspaces SET ${keys.map((key) => `${key} = ?`).join(", ")} WHERE id = ?`)
+      .run(...keys.map((key) => values[key]), req.params.id);
+  }
+  return res.json(db.prepare("SELECT id, company_name, role_title, created_at FROM workspaces WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/workspaces/:id", (req, res) => {
+  const result = db.prepare("DELETE FROM workspaces WHERE id = ?").run(req.params.id);
+  if (!result.changes) return sendNotFound(res, "Workspace");
+  return res.status(204).end();
+});
+
+app.get("/api/workspaces/:workspaceId/rounds", (req, res) => {
+  if (!db.prepare("SELECT id FROM workspaces WHERE id = ?").get(req.params.workspaceId)) return sendNotFound(res, "Workspace");
+  const rounds = db.prepare("SELECT * FROM interview_rounds WHERE workspace_id = ? ORDER BY sequence_order, id").all(req.params.workspaceId);
+  return res.json(rounds.map(serializeRound));
+});
+
+app.post("/api/workspaces/:workspaceId/rounds", (req, res) => {
+  if (!db.prepare("SELECT id FROM workspaces WHERE id = ?").get(req.params.workspaceId)) return sendNotFound(res, "Workspace");
+  const values = sanitizeBody("interview_rounds", roundColumns, req.body || {});
+  const nextOrder = db.prepare("SELECT coalesce(max(sequence_order), 0) + 1 AS value FROM interview_rounds WHERE workspace_id = ?").get(req.params.workspaceId).value;
+  const result = db.prepare(`
+    INSERT INTO interview_rounds
+      (workspace_id, label, stage_type, scheduled_date, interviewers, sequence_order, status, interviewer_notes, questions_to_ask, outcome_notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    req.params.workspaceId,
+    values.label || `Round ${nextOrder}`,
+    values.stage_type || "other",
+    values.scheduled_date || "",
+    values.interviewers || "[]",
+    values.sequence_order ?? nextOrder,
+    values.status || "upcoming",
+    values.interviewer_notes || "",
+    values.questions_to_ask || "",
+    values.outcome_notes || "",
+  );
+  return res.status(201).json(serializeRound(db.prepare("SELECT * FROM interview_rounds WHERE id = ?").get(result.lastInsertRowid)));
+});
+
+app.get("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
+  const round = db.prepare("SELECT * FROM interview_rounds WHERE id = ? AND workspace_id = ?").get(req.params.id, req.params.workspaceId);
+  if (!round) return sendNotFound(res, "Interview round");
+  return res.json(serializeRound(round));
+});
+
+app.put("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
+  if (!db.prepare("SELECT id FROM interview_rounds WHERE id = ? AND workspace_id = ?").get(req.params.id, req.params.workspaceId)) return sendNotFound(res, "Interview round");
+  const values = sanitizeBody("interview_rounds", roundColumns, req.body || {});
+  const keys = Object.keys(values);
+  if (keys.length) {
+    db.prepare(`UPDATE interview_rounds SET ${keys.map((key) => `${key} = ?`).join(", ")} WHERE id = ? AND workspace_id = ?`)
+      .run(...keys.map((key) => values[key]), req.params.id, req.params.workspaceId);
+  }
+  return res.json(serializeRound(db.prepare("SELECT * FROM interview_rounds WHERE id = ?").get(req.params.id)));
+});
+
+app.delete("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
+  const result = db.prepare("DELETE FROM interview_rounds WHERE id = ? AND workspace_id = ?").run(req.params.id, req.params.workspaceId);
+  if (!result.changes) return sendNotFound(res, "Interview round");
+  return res.status(204).end();
+});
+
 registerCrudRoute("story-bank", "story_bank", ["module", "title", "tags", "situation", "task", "action", "result", "used_for", "status"]);
 registerCrudRoute("question-bank", "question_bank", ["module", "sub_topic", "question", "my_answer", "status"]);
 registerCrudRoute("reliability-incidents", "reliability_incidents", ["title", "what_broke", "how_found", "how_fixed", "what_changed_after", "tags"]);
@@ -180,7 +274,13 @@ function getDrillTree(id) {
 }
 
 app.get("/api/drill-trees", (_req, res) => {
-  const trees = db.prepare("SELECT * FROM drill_trees ORDER BY id").all();
+  const hasRoundFilter = Object.prototype.hasOwnProperty.call(_req.query, "round_id");
+  const requestedRoundId = Number(_req.query.round_id);
+  const trees = hasRoundFilter
+    ? Number.isInteger(requestedRoundId) && requestedRoundId > 0
+      ? db.prepare("SELECT * FROM drill_trees WHERE round_id IS NULL OR round_id = ? ORDER BY id").all(requestedRoundId)
+      : db.prepare("SELECT * FROM drill_trees WHERE round_id IS NULL ORDER BY id").all()
+    : db.prepare("SELECT * FROM drill_trees ORDER BY id").all();
   const followups = db.prepare("SELECT * FROM drill_followups ORDER BY level, id").all();
   const grouped = followups.reduce((map, row) => {
     const rows = map.get(row.drill_tree_id) || [];
@@ -199,8 +299,8 @@ app.get("/api/drill-trees/:id", (req, res) => {
 
 const writeDrillTree = db.transaction((id, body) => {
   writeMetadata("drill-trees", id, body._ui);
-  if (Object.prototype.hasOwnProperty.call(body, "module") || Object.prototype.hasOwnProperty.call(body, "root_question")) {
-    const values = sanitizeBody("drill_trees", ["module", "root_question"], body);
+  if (["module", "root_question", "round_id"].some((key) => Object.prototype.hasOwnProperty.call(body, key))) {
+    const values = sanitizeBody("drill_trees", ["module", "root_question", "round_id"], body);
     const keys = Object.keys(values);
     if (keys.length) {
       db.prepare(`UPDATE drill_trees SET ${keys.map((key) => `${key} = ?`).join(", ")} WHERE id = ?`)
@@ -231,8 +331,9 @@ const writeDrillTree = db.transaction((id, body) => {
 });
 
 app.post("/api/drill-trees", (req, res) => {
-  const result = db.prepare("INSERT INTO drill_trees (module, root_question) VALUES (?, ?)")
-    .run(req.body?.module ?? "", req.body?.root_question ?? "");
+  const roundId = Number.isInteger(req.body?.round_id) ? req.body.round_id : null;
+  const result = db.prepare("INSERT INTO drill_trees (module, root_question, round_id) VALUES (?, ?, ?)")
+    .run(req.body?.module ?? "", req.body?.root_question ?? "", roundId);
   writeDrillTree(Number(result.lastInsertRowid), req.body || {});
   res.status(201).json(getDrillTree(result.lastInsertRowid));
 });

@@ -41,4 +41,4 @@ The Compose service mounts `./data` into the container, so dashboard content sur
 
 ## API
 
-The REST API is available below `/api` on the same host and port as the dashboard. It includes settings, story and question banks, nested drill trees, Scheduling Machine notes, reliability incidents, the translation map, knowledge items, and cross-table search at `/api/search?q=...`.
+The REST API is available below `/api` on the same host and port as the dashboard. Opportunities are managed at `/api/workspaces`, with interview rounds nested at `/api/workspaces/:workspaceId/rounds`. Drill trees can be general preparation or associated with a round through `round_id`. The API also includes story and question banks, Scheduling Machine notes, reliability incidents, the translation map, knowledge items, and cross-table search at `/api/search?q=...`.

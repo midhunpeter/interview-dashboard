@@ -39,6 +39,9 @@ const seedItem = (module, title, type = "note", priority = "medium", starred = f
 export function createInitialData() {
   return {
     schemaVersion: SCHEMA_VERSION,
+    workspaces: [{ id: 1, companyName: "Tempus", roleTitle: "", createdAt: "" }],
+    activeWorkspaceId: 1,
+    rounds: [],
     settings: {
       companyName: "Tempus",
       roleTitle: "",
@@ -68,6 +71,7 @@ export function createInitialData() {
       {
         id: createId(),
         module: "hiring-manager-simulation",
+        roundId: null,
         title: "Walk me through the Scheduling Machine",
         tags: ["must-review"],
         priority: "high",
@@ -242,6 +246,7 @@ function rowToTree(row) {
   return {
     id: treeId,
     module: row.module || "hiring-manager-simulation",
+    roundId: row.round_id ?? null,
     title: ui.title || row.root_question || "Untitled drill tree",
     tags: ui.tags || [],
     priority: ui.priority || "high",
@@ -258,8 +263,9 @@ async function loadDatabaseData() {
   itemIdentities.clear();
   treeIdentities.clear();
   followupIdentities.clear();
-  const [settings, stories, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
+  const [settings, workspacesResponse, stories, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
     api("/settings"),
+    api("/workspaces"),
     api("/story-bank"),
     api("/question-bank"),
     api("/drill-trees"),
@@ -269,14 +275,27 @@ async function loadDatabaseData() {
     api("/knowledge-items"),
     api("/item-images"),
   ]);
+  const workspaces = workspacesResponse.map((workspace) => ({
+    id: workspace.id,
+    companyName: workspace.company_name || "Untitled company",
+    roleTitle: workspace.role_title || "",
+    createdAt: workspace.created_at || "",
+  }));
+  const requestedWorkspaceId = Number(settings._ui?.activeWorkspaceId);
+  const activeWorkspace = workspaces.find((workspace) => workspace.id === requestedWorkspaceId) || workspaces[0] || null;
+  const roundsResponse = activeWorkspace ? await api(`/workspaces/${activeWorkspace.id}/rounds`) : [];
+  const rounds = roundsResponse.map(roundFromApi);
   const data = {
     schemaVersion: SCHEMA_VERSION,
+    workspaces,
+    activeWorkspaceId: activeWorkspace?.id ?? null,
+    rounds,
     settings: {
-      companyName: settings.company_name || "Tempus",
-      roleTitle: settings.role_title || "",
-      interviewDate: settings.interview_date || "",
-      interviewStage: settings._ui?.interviewStage || "Hiring manager interview",
-      interviewers: settings.interviewers || [],
+      companyName: activeWorkspace?.companyName || "Tempus",
+      roleTitle: activeWorkspace?.roleTitle || "",
+      interviewDate: "",
+      interviewStage: "",
+      interviewers: [],
       preparationModules: settings._ui?.preparationModules || [
         ...MODULES.map((module) => ({ ...module })),
         ...(settings._ui?.customModules || []),
@@ -417,6 +436,7 @@ async function persistItems(items) {
 function drillPayload(tree) {
   return {
     module: tree.module,
+    round_id: tree.roundId ?? null,
     root_question: tree.title || tree.nodes[0]?.question || "Root question",
     _ui: {
       title: tree.title,
@@ -467,12 +487,8 @@ async function persistTrees(trees) {
 
 async function persistData(data) {
   await api("/settings", { method: "PUT", body: {
-    company_name: data.settings.companyName,
-    role_title: data.settings.roleTitle,
-    interview_date: data.settings.interviewDate,
-    interviewers: data.settings.interviewers || [],
     _ui: {
-      interviewStage: data.settings.interviewStage || "",
+      activeWorkspaceId: data.activeWorkspaceId,
       preparationModules: data.settings.preparationModules || MODULES,
     },
   } });
@@ -484,6 +500,67 @@ export function saveData(data) {
   const run = saveQueue.catch(() => undefined).then(() => persistData(data));
   saveQueue = run;
   return run;
+}
+
+function roundFromApi(round) {
+  return {
+    id: round.id,
+    workspaceId: round.workspace_id,
+    label: round.label || "Untitled round",
+    stageType: round.stage_type || "other",
+    scheduledDate: round.scheduled_date || "",
+    interviewers: round.interviewers || [],
+    sequenceOrder: round.sequence_order ?? 0,
+    status: round.status || "upcoming",
+    interviewerNotes: round.interviewer_notes || "",
+    questionsToAsk: round.questions_to_ask || "",
+    outcomeNotes: round.outcome_notes || "",
+    createdAt: round.created_at || "",
+  };
+}
+
+const roundToApi = (round) => ({
+  label: round.label,
+  stage_type: round.stageType,
+  scheduled_date: round.scheduledDate,
+  interviewers: round.interviewers || [],
+  sequence_order: round.sequenceOrder,
+  status: round.status,
+  interviewer_notes: round.interviewerNotes || "",
+  questions_to_ask: round.questionsToAsk || "",
+  outcome_notes: round.outcomeNotes || "",
+});
+
+export async function loadWorkspaceRounds(workspaceId) {
+  return (await api(`/workspaces/${workspaceId}/rounds`)).map(roundFromApi);
+}
+
+export async function createWorkspace(values) {
+  const workspace = await api("/workspaces", { method: "POST", body: {
+    company_name: values.companyName,
+    role_title: values.roleTitle,
+  } });
+  return { id: workspace.id, companyName: workspace.company_name, roleTitle: workspace.role_title || "", createdAt: workspace.created_at || "" };
+}
+
+export async function updateWorkspace(workspaceId, values) {
+  const workspace = await api(`/workspaces/${workspaceId}`, { method: "PUT", body: {
+    company_name: values.companyName,
+    role_title: values.roleTitle,
+  } });
+  return { id: workspace.id, companyName: workspace.company_name, roleTitle: workspace.role_title || "", createdAt: workspace.created_at || "" };
+}
+
+export async function createInterviewRound(workspaceId, round) {
+  return roundFromApi(await api(`/workspaces/${workspaceId}/rounds`, { method: "POST", body: roundToApi(round) }));
+}
+
+export async function updateInterviewRound(workspaceId, round) {
+  return roundFromApi(await api(`/workspaces/${workspaceId}/rounds/${round.id}`, { method: "PUT", body: roundToApi(round) }));
+}
+
+export function deleteInterviewRound(workspaceId, roundId) {
+  return api(`/workspaces/${workspaceId}/rounds/${roundId}`, { method: "DELETE" });
 }
 
 export async function searchData(query) {

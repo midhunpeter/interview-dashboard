@@ -9,6 +9,12 @@ import {
   moduleReadiness,
   overallReadiness,
   saveData,
+  loadWorkspaceRounds,
+  createWorkspace,
+  updateWorkspace,
+  createInterviewRound,
+  updateInterviewRound,
+  deleteInterviewRound,
   uploadItemImage,
   deleteItemImage,
 } from "./data";
@@ -25,6 +31,18 @@ const TYPE_LABELS = {
   research: "Research",
   "open-question": "Open question",
 };
+
+const ROUND_STAGE_TYPES = [
+  ["recruiter_screen", "Recruiter screen"],
+  ["hiring_manager", "Hiring manager"],
+  ["technical_panel", "Technical panel"],
+  ["onsite", "Onsite"],
+  ["final", "Final"],
+  ["offer", "Offer"],
+  ["other", "Other"],
+];
+const ROUND_STATUSES = ["upcoming", "completed", "cancelled"];
+const roundStageLabel = (stageType) => ROUND_STAGE_TYPES.find(([value]) => value === stageType)?.[1] || "Other";
 
 const isSchedulingOverview = (item) => item.module === "scheduling-machine"
   && item.title === "Platform overview and scale"
@@ -111,6 +129,7 @@ function App() {
   const importRef = useRef(null);
   const hydrated = useRef(false);
   const modules = useMemo(() => data.settings.preparationModules || MODULES, [data.settings.preparationModules]);
+  const activeWorkspace = data.workspaces?.find((workspace) => workspace.id === data.activeWorkspaceId) || data.workspaces?.[0] || null;
 
   useEffect(() => {
     let cancelled = false;
@@ -292,6 +311,106 @@ function App() {
     }
   };
 
+  const selectWorkspace = async (workspaceId) => {
+    const workspace = data.workspaces.find((entry) => entry.id === workspaceId);
+    if (!workspace || workspaceId === data.activeWorkspaceId) return;
+    setSaveState("Loading…");
+    try {
+      const rounds = await loadWorkspaceRounds(workspaceId);
+      setData((current) => ({
+        ...current,
+        activeWorkspaceId: workspaceId,
+        rounds,
+        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle },
+      }));
+      setSaveState("Saved to SQLite");
+      setNotice(`Switched to ${workspace.companyName}`);
+    } catch (error) {
+      console.error(error);
+      setSaveState("Load failed");
+      setNotice("Opportunity could not be loaded");
+    }
+  };
+
+  const addWorkspace = async () => {
+    try {
+      const workspace = await createWorkspace({ companyName: "New opportunity", roleTitle: "" });
+      setData((current) => ({
+        ...current,
+        workspaces: [...current.workspaces, workspace],
+        activeWorkspaceId: workspace.id,
+        rounds: [],
+        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle },
+      }));
+      setNotice("Opportunity added");
+    } catch (error) {
+      console.error(error);
+      setNotice("Opportunity could not be added");
+    }
+  };
+
+  const saveWorkspaceDetails = async (values) => {
+    if (!data.activeWorkspaceId) return false;
+    try {
+      const workspace = await updateWorkspace(data.activeWorkspaceId, values);
+      setData((current) => ({
+        ...current,
+        workspaces: current.workspaces.map((entry) => entry.id === workspace.id ? workspace : entry),
+        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle },
+      }));
+      setNotice("Opportunity saved");
+      return true;
+    } catch (error) {
+      console.error(error);
+      setNotice("Opportunity could not be saved");
+      return false;
+    }
+  };
+
+  const addRound = async (round) => {
+    try {
+      const created = await createInterviewRound(data.activeWorkspaceId, round);
+      setData((current) => ({ ...current, rounds: [...current.rounds, created] }));
+      setNotice("Interview round added");
+      return created;
+    } catch (error) {
+      console.error(error);
+      setNotice("Interview round could not be added");
+      return null;
+    }
+  };
+
+  const saveRound = async (round) => {
+    try {
+      const saved = await updateInterviewRound(data.activeWorkspaceId, round);
+      setData((current) => ({ ...current, rounds: current.rounds.map((entry) => entry.id === saved.id ? saved : entry) }));
+      setNotice("Interview round saved");
+      return saved;
+    } catch (error) {
+      console.error(error);
+      setNotice("Interview round could not be saved");
+      return null;
+    }
+  };
+
+  const removeRound = async (round) => {
+    if (!window.confirm(`Delete “${round.label}”? Its drill trees will become general preparation.`)) return false;
+    try {
+      await deleteInterviewRound(data.activeWorkspaceId, round.id);
+      setData((current) => ({
+        ...current,
+        rounds: current.rounds.filter((entry) => entry.id !== round.id),
+        drillTrees: current.drillTrees.map((tree) => tree.roundId === round.id ? { ...tree, roundId: null } : tree),
+      }));
+      setNotice("Interview round deleted; its drill trees are now general prep");
+      return true;
+    } catch (error) {
+      console.error(error);
+      setNotice("Interview round could not be deleted");
+      return false;
+    }
+  };
+
   const deletePreparationSection = async (sectionId) => {
     const section = (data.settings.preparationModules || []).find((entry) => entry.id === sectionId);
     if (section && !window.confirm(`Delete the “${section.label}” preparation section and all of its items?`)) return false;
@@ -322,11 +441,12 @@ function App() {
     }));
   };
 
-  const addTree = (moduleId) => {
+  const addTree = (moduleId, roundId = null) => {
     const timestamp = new Date().toISOString();
     const tree = {
       id: createId(),
       module: moduleId,
+      roundId,
       title: "Untitled drill tree",
       tags: [],
       priority: "high",
@@ -373,6 +493,9 @@ function App() {
       exportData();
       setData({
         ...parsed,
+        workspaces: Array.isArray(parsed.workspaces) && parsed.workspaces.length ? parsed.workspaces : data.workspaces,
+        activeWorkspaceId: parsed.activeWorkspaceId || data.activeWorkspaceId,
+        rounds: Array.isArray(parsed.rounds) ? parsed.rounds : data.rounds,
         settings: {
           ...parsed.settings,
           preparationModules: parsed.settings.preparationModules || [...MODULES, ...(parsed.settings.customModules || [])],
@@ -391,7 +514,7 @@ function App() {
       <Sidebar view={view} data={data} modules={modules} onNavigate={navigate} />
       <div className="workspace">
         <Header
-          company={data.settings.companyName}
+          company={activeWorkspace?.companyName}
           query={query}
           setQuery={setQuery}
           saveState={saveState}
@@ -417,6 +540,12 @@ function App() {
             }}
             deletePreparationSection={deletePreparationSection}
             reorderPreparationSections={reorderPreparationSections}
+            selectWorkspace={selectWorkspace}
+            addWorkspace={addWorkspace}
+            saveWorkspaceDetails={saveWorkspaceDetails}
+            addRound={addRound}
+            saveRound={saveRound}
+            removeRound={removeRound}
           />
         ) : module ? (
           <ModuleView
@@ -433,6 +562,7 @@ function App() {
             updateTree={updateTree}
             addTree={addTree}
             deleteTree={deleteTree}
+            saveRound={saveRound}
           />
         ) : null}
       </div>
@@ -503,20 +633,25 @@ function Dashboard({ data, modules, onNavigate }) {
       .sort((a, b) => rank(a) - rank(b) || new Date(b.updatedAt) - new Date(a.updatedAt))
       .slice(0, 10);
   }, [data.items]);
-  const days = countdown(data.settings.interviewDate);
+  const workspace = data.workspaces?.find((entry) => entry.id === data.activeWorkspaceId);
+  const rounds = [...(data.rounds || [])].sort((a, b) => a.sequenceOrder - b.sequenceOrder || a.id - b.id);
+  const nextRound = rounds
+    .filter((round) => round.status === "upcoming" && !Number.isNaN(new Date(round.scheduledDate).getTime()))
+    .sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate))[0] || null;
+  const days = countdown(nextRound?.scheduledDate);
 
   return (
     <main className="page dashboard-page">
       <section className="hero-row">
         <div>
-          <p className="eyebrow">{data.settings.interviewStage || "Interview preparation"}</p>
+          <p className="eyebrow">{workspace?.roleTitle || "Interview preparation"}</p>
           <h1>Ready for the conversation,<br />not just the questions.</h1>
           <p className="hero-copy">Build depth, rehearse the follow-ups, and keep your strongest evidence close at hand.</p>
         </div>
         <div className="countdown-card">
-          <span className="eyebrow">Interview countdown</span>
-          <strong>{days === null ? "Set a date" : days < 0 ? "Interview complete" : `${days} day${days === 1 ? "" : "s"}`}</strong>
-          <small>{data.settings.interviewDate ? formatDate(data.settings.interviewDate) : "Add the interview date in Settings"}</small>
+          <span className="eyebrow">{nextRound?.label || "Next interview round"}</span>
+          <strong>{days === null ? "No upcoming round" : days < 0 ? "Past due" : days === 0 ? "Today" : `${days} day${days === 1 ? "" : "s"}`}</strong>
+          <small>{nextRound ? `${roundStageLabel(nextRound.stageType)} · ${formatDate(nextRound.scheduledDate)}` : "Add a scheduled round in Settings"}</small>
         </div>
       </section>
 
@@ -549,6 +684,21 @@ function Dashboard({ data, modules, onNavigate }) {
         </article>
       </section>
 
+      <section className="rounds-timeline panel">
+        <div className="panel-heading"><div><p className="eyebrow">Interview plan</p><h2>Rounds timeline</h2></div><button className="text-button" onClick={() => onNavigate("settings")}>Manage rounds →</button></div>
+        {rounds.length === 0 ? <p className="muted">No interview rounds added yet.</p> : (
+          <ol>
+            {rounds.map((round, index) => (
+              <li key={round.id} className={`round-timeline-item ${round.status}`}>
+                <span className="round-sequence">{index + 1}</span>
+                <div><strong>{round.label}</strong><small>{roundStageLabel(round.stageType)} · {round.scheduledDate ? formatDate(round.scheduledDate) : "Date not set"}</small></div>
+                <span className={`round-status ${round.status}`}>{round.status}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+
       <section className="modules-section">
         <div className="section-heading"><div><p className="eyebrow">Preparation sections</p><h2>Preparation map</h2></div><button className="text-button" onClick={() => onNavigate("quick-review")}>Open quick review →</button></div>
         <div className="module-grid">
@@ -572,9 +722,18 @@ function Dashboard({ data, modules, onNavigate }) {
   );
 }
 
-function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateItem, addItem, saveNow, addImagesToItem, removeImageFromItem, updateTree, addTree, deleteTree }) {
+function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateItem, addItem, saveNow, addImagesToItem, removeImageFromItem, updateTree, addTree, deleteTree, saveRound }) {
   const items = data.items.filter((item) => item.module === module.id).sort((a, b) => a.sortOrder - b.sortOrder);
-  const trees = data.drillTrees.filter((tree) => tree.module === module.id);
+  const [selectedRoundId, setSelectedRoundId] = useState(null);
+  const isSimulation = module.id === "hiring-manager-simulation";
+  const selectedRound = data.rounds.find((round) => round.id === selectedRoundId) || null;
+  useEffect(() => {
+    if (selectedRoundId != null && !data.rounds.some((round) => round.id === selectedRoundId)) setSelectedRoundId(null);
+  }, [data.rounds, selectedRoundId]);
+  const moduleTrees = data.drillTrees.filter((tree) => tree.module === module.id);
+  const trees = isSimulation
+    ? moduleTrees.filter((tree) => tree.roundId == null || (selectedRoundId != null && tree.roundId === selectedRoundId))
+    : moduleTrees;
   const progress = moduleReadiness(data, module.id);
   return (
     <main className="page">
@@ -583,15 +742,36 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
         <div><p className="eyebrow">Preparation module</p><h1>{module.label}</h1><p>{module.description}</p></div>
         <div className="module-score"><strong>{progress ?? 0}%</strong><span>readiness</span></div>
       </section>
+      {isSimulation && (
+        <section className="round-context-panel panel">
+          <div><p className="eyebrow">Round context</p><h2>Simulation focus</h2><p>General preparation is always included alongside the selected interview round.</p></div>
+          <label>Interview round<select value={selectedRoundId ?? ""} onChange={(event) => setSelectedRoundId(event.target.value ? Number(event.target.value) : null)}><option value="">General prep</option>{data.rounds.map((round) => <option value={round.id} key={round.id}>{round.label}</option>)}</select></label>
+        </section>
+      )}
+      {isSimulation && selectedRound && <RoundPreparation round={selectedRound} saveRound={saveRound} />}
       <div className="section-heading content-heading"><div><p className="eyebrow">Working set</p><h2>Your preparation items</h2></div><button className="primary-button" onClick={() => addItem(module.id)}>＋ Add item</button></div>
       <section className="item-list">
         {items.length === 0 && <EmptyState onAdd={() => addItem(module.id)} />}
         {items.map((item, index) => <ItemEditor key={item.id} item={item} module={module} updateItem={updateItem} moveItem={moveItem} canMoveUp={index > 0} canMoveDown={index < items.length - 1} deleteItem={deleteItem} duplicateItem={duplicateItem} saveNow={saveNow} addImagesToItem={addImagesToItem} removeImageFromItem={removeImageFromItem} />)}
       </section>
       {(module.id === "hiring-manager-simulation" || trees.length > 0) && (
-        <DrillSection module={module} trees={trees} updateTree={updateTree} addTree={addTree} deleteTree={deleteTree} />
+        <DrillSection module={module} trees={trees} updateTree={updateTree} addTree={addTree} deleteTree={deleteTree} roundId={isSimulation ? selectedRoundId : null} rounds={data.rounds} />
       )}
     </main>
+  );
+}
+
+function RoundPreparation({ round, saveRound }) {
+  const [draft, setDraft] = useState(round);
+  useEffect(() => setDraft(round), [round]);
+  return (
+    <section className="round-preparation panel">
+      <div className="section-heading"><div><p className="eyebrow">{round.label}</p><h2>Round-specific preparation</h2></div><button type="button" className="primary-button" onClick={() => saveRound(draft)}>Save round notes</button></div>
+      <div className="round-preparation-grid">
+        <FormattedTextarea label="Interviewer research" value={draft.interviewerNotes || ""} onChange={(value) => setDraft((current) => ({ ...current, interviewerNotes: value }))} placeholder="Background, communication style, mutual connections…" />
+        <FormattedTextarea label="Questions to ask" value={draft.questionsToAsk || ""} onChange={(value) => setDraft((current) => ({ ...current, questionsToAsk: value }))} placeholder="Questions tailored to this round…" />
+      </div>
+    </section>
   );
 }
 
@@ -759,15 +939,15 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
   );
 }
 
-function DrillSection({ module, trees, updateTree, addTree, deleteTree }) {
+function DrillSection({ module, trees, updateTree, addTree, deleteTree, roundId = null, rounds = [] }) {
   const [practiceTree, setPracticeTree] = useState(null);
   return (
     <section className="drill-section">
-      <div className="section-heading"><div><p className="eyebrow">Progressive drilling</p><h2>Follow-up depth</h2></div><button className="primary-button" onClick={() => addTree(module.id)}>＋ Add drill tree</button></div>
+      <div className="section-heading"><div><p className="eyebrow">Progressive drilling</p><h2>Follow-up depth</h2></div><button className="primary-button" onClick={() => addTree(module.id, roundId)}>＋ Add drill tree</button></div>
       {trees.length === 0 ? <p className="muted">No drill trees are assigned to this module yet.</p> : trees.map((tree) => (
         <article className="drill-card" key={tree.id}>
           <div className="drill-heading">
-            <div><small>{tree.nodes.length} levels</small><input className="drill-title-input" value={tree.title} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, title: event.target.value }))} aria-label="Drill tree title" /></div>
+            <div><small>{tree.nodes.length} levels · {tree.roundId == null ? "General prep" : rounds.find((round) => round.id === tree.roundId)?.label || "Interview round"}</small><input className="drill-title-input" value={tree.title} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, title: event.target.value }))} aria-label="Drill tree title" /></div>
             <div className="drill-actions"><button className="danger-link" onClick={() => deleteTree(tree.id)}>Delete</button><button className="secondary-button" onClick={() => setPracticeTree(tree)}>Practice tree →</button></div>
           </div>
           <div className="drill-nodes">
@@ -879,9 +1059,42 @@ function QuickReview({ data, modules, updateItem, updateTree, saveNow, onNavigat
 
 const CUSTOM_MODULE_COLORS = ["#4f7b68", "#7b6455", "#65759a", "#8a647d", "#5c7b80", "#85733f"];
 
-function Settings({ data, setData, exportData, importData, resetData, deletePreparationSection, reorderPreparationSections }) {
-  const updateSettings = (patch) => setData((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
+function Settings({ data, setData, exportData, importData, resetData, deletePreparationSection, reorderPreparationSections, selectWorkspace, addWorkspace, saveWorkspaceDetails, addRound, saveRound, removeRound }) {
+  const activeWorkspace = data.workspaces.find((workspace) => workspace.id === data.activeWorkspaceId) || data.workspaces[0];
+  const [opportunityDraft, setOpportunityDraft] = useState(() => ({ companyName: activeWorkspace?.companyName || "", roleTitle: activeWorkspace?.roleTitle || "" }));
+  const [roundDrafts, setRoundDrafts] = useState(() => data.rounds || []);
   const [sectionDrafts, setSectionDrafts] = useState(() => data.settings.preparationModules || []);
+  useEffect(() => {
+    setOpportunityDraft({ companyName: activeWorkspace?.companyName || "", roleTitle: activeWorkspace?.roleTitle || "" });
+  }, [activeWorkspace?.id, activeWorkspace?.companyName, activeWorkspace?.roleTitle]);
+  useEffect(() => setRoundDrafts(data.rounds || []), [data.rounds]);
+  const updateRoundDraft = (id, patch) => setRoundDrafts((current) => current.map((round) => round.id === id ? { ...round, ...patch } : round));
+  const addRoundDraft = () => setRoundDrafts((current) => [...current, {
+    id: `new-${createId()}`,
+    workspaceId: data.activeWorkspaceId,
+    label: "",
+    stageType: "other",
+    scheduledDate: "",
+    interviewers: [],
+    sequenceOrder: current.length + 1,
+    status: "upcoming",
+    interviewerNotes: "",
+    questionsToAsk: "",
+    outcomeNotes: "",
+    isNew: true,
+  }]);
+  const saveRoundDraft = async (draft) => {
+    if (!draft.label.trim()) return window.alert("Enter a label for the interview round before saving.");
+    if (draft.isNew) await addRound({ ...draft, label: draft.label.trim(), id: undefined, isNew: undefined });
+    else await saveRound({ ...draft, label: draft.label.trim() });
+  };
+  const deleteRoundDraft = async (draft) => {
+    if (draft.isNew) {
+      if (window.confirm("Delete this unsaved interview round?")) setRoundDrafts((current) => current.filter((round) => round.id !== draft.id));
+      return;
+    }
+    await removeRound(draft);
+  };
   const addSectionDraft = () => {
     setSectionDrafts((current) => [...current, {
       id: `custom-${createId()}`,
@@ -926,28 +1139,49 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
   return (
     <main className="page settings-page">
       <section className="simple-header"><p className="eyebrow">Workspace setup</p><h1>Settings & backup</h1><p>Keep interview details current and protect your local preparation data.</p></section>
-      <section className="settings-panel panel">
-        <h2>Interview details</h2>
-        <div className="form-grid two">
-          <label>Company<input value={data.settings.companyName} onChange={(event) => updateSettings({ companyName: event.target.value })} /></label>
-          <label>Role title<input value={data.settings.roleTitle} onChange={(event) => updateSettings({ roleTitle: event.target.value })} placeholder="Product Manager, Data Platform" /></label>
-          <label>Interview stage<input value={data.settings.interviewStage} onChange={(event) => updateSettings({ interviewStage: event.target.value })} /></label>
-          <label>Interview date<input type="datetime-local" value={data.settings.interviewDate} onChange={(event) => updateSettings({ interviewDate: event.target.value })} /></label>
+      <section className="settings-panel panel opportunity-settings">
+        <div className="settings-section-heading"><h2>Opportunity details</h2><p>Each workspace represents one company and role.</p></div>
+        <div className="opportunity-picker">
+          <label>Current opportunity
+            <select value={data.activeWorkspaceId || ""} onChange={(event) => selectWorkspace(Number(event.target.value))}>
+              {data.workspaces.map((workspace) => <option value={workspace.id} key={workspace.id}>{workspace.companyName}{workspace.roleTitle ? ` — ${workspace.roleTitle}` : ""}</option>)}
+            </select>
+          </label>
+          <button type="button" className="secondary-button" onClick={addWorkspace}>＋ New opportunity</button>
         </div>
-        <label className="settings-wide-label">Interviewer / panel names
-          <input
-            value={(data.settings.interviewers || []).map((person) => person.name).join(", ")}
-            onChange={(event) => updateSettings({
-              interviewers: event.target.value.split(",").map((name) => name.trim()).filter(Boolean).map((name, index) => ({
-                id: data.settings.interviewers?.[index]?.id || createId(),
-                name,
-                title: data.settings.interviewers?.[index]?.title || "",
-                notes: data.settings.interviewers?.[index]?.notes || "",
-              })),
-            })}
-            placeholder="Alex Rivera, Morgan Lee"
-          />
-        </label>
+        <div className="form-grid two">
+          <label>Company<input value={opportunityDraft.companyName} onChange={(event) => setOpportunityDraft((current) => ({ ...current, companyName: event.target.value }))} /></label>
+          <label>Role title<input value={opportunityDraft.roleTitle} onChange={(event) => setOpportunityDraft((current) => ({ ...current, roleTitle: event.target.value }))} placeholder="Product Manager, Data Platform" /></label>
+        </div>
+        <button type="button" className="primary-button" onClick={() => saveWorkspaceDetails(opportunityDraft)}>Save opportunity</button>
+      </section>
+      <section className="settings-panel panel rounds-settings">
+        <div className="settings-section-heading"><h2>Interview rounds</h2><p>Plan and track every stage for this opportunity.</p></div>
+        <div className="round-draft-list">
+          {roundDrafts.length === 0 && <p className="muted">No interview rounds yet. Add the first round below.</p>}
+          {roundDrafts.map((round) => (
+            <article className="round-draft" key={round.id}>
+              <div className="round-draft-heading">
+                <strong>{round.label || "New interview round"}</strong>
+                <span className={`round-status ${round.status}`}>{round.status}</span>
+              </div>
+              <div className="round-fields">
+                <label>Round label<input value={round.label} onChange={(event) => updateRoundDraft(round.id, { label: event.target.value })} placeholder="Hiring Manager Interview" /></label>
+                <label>Stage type<select value={round.stageType} onChange={(event) => updateRoundDraft(round.id, { stageType: event.target.value })}>{ROUND_STAGE_TYPES.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+                <label>Scheduled date<input type="datetime-local" value={round.scheduledDate} onChange={(event) => updateRoundDraft(round.id, { scheduledDate: event.target.value })} /></label>
+                <label>Status<select value={round.status} onChange={(event) => updateRoundDraft(round.id, { status: event.target.value })}>{ROUND_STATUSES.map((status) => <option value={status} key={status}>{status}</option>)}</select></label>
+                <label className="round-interviewers">Interviewers<input value={(round.interviewers || []).map((person) => typeof person === "string" ? person : person.name).filter(Boolean).join(", ")} onChange={(event) => updateRoundDraft(round.id, { interviewers: event.target.value.split(",").map((name, index) => ({ id: round.interviewers?.[index]?.id || createId(), name: name.trim() })).filter((person) => person.name) })} placeholder="Alex Rivera, Morgan Lee" /></label>
+              </div>
+              <div className="round-notes-grid">
+                <FormattedTextarea label="Interviewer research" value={round.interviewerNotes || ""} onChange={(value) => updateRoundDraft(round.id, { interviewerNotes: value })} />
+                <FormattedTextarea label="Questions to ask" value={round.questionsToAsk || ""} onChange={(value) => updateRoundDraft(round.id, { questionsToAsk: value })} />
+                <FormattedTextarea label="Outcome notes" value={round.outcomeNotes || ""} onChange={(value) => updateRoundDraft(round.id, { outcomeNotes: value })} />
+              </div>
+              <div className="round-draft-actions"><button type="button" className="save-link" onClick={() => saveRoundDraft(round)}>Save</button><button type="button" className="danger-link" onClick={() => deleteRoundDraft(round)}>Delete</button></div>
+            </article>
+          ))}
+        </div>
+        <button type="button" className="add-preparation-button" onClick={addRoundDraft}><span>＋</span>Add interview round</button>
       </section>
       <section className="settings-panel panel preparation-settings">
         <div className="settings-section-heading">

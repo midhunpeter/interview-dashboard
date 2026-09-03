@@ -23,6 +23,28 @@ db.exec(`
     interviewers TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_name TEXT,
+    role_title TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS interview_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+    label TEXT,
+    stage_type TEXT,
+    scheduled_date TEXT,
+    interviewers TEXT,
+    sequence_order INTEGER,
+    status TEXT DEFAULT 'upcoming',
+    interviewer_notes TEXT,
+    questions_to_ask TEXT,
+    outcome_notes TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS story_bank (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     module TEXT,
@@ -124,3 +146,69 @@ db.prepare(`
     (id, overview, architecture_notes, ownership_stories, scale_metrics, lessons_learned)
   VALUES (1, '', '[]', '[]', '', '')
 `).run();
+
+const tableColumns = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+
+if (!tableColumns("drill_trees").has("round_id")) {
+  db.exec("ALTER TABLE drill_trees ADD COLUMN round_id INTEGER REFERENCES interview_rounds(id) ON DELETE SET NULL");
+}
+
+const inferStageType = (label = "") => {
+  const value = label.toLowerCase();
+  if (value.includes("recruit")) return "recruiter_screen";
+  if (value.includes("hiring") || value.includes("manager")) return "hiring_manager";
+  if (value.includes("technical") || value.includes("panel")) return "technical_panel";
+  if (value.includes("onsite") || value.includes("on-site")) return "onsite";
+  if (value.includes("final")) return "final";
+  if (value.includes("offer")) return "offer";
+  return "other";
+};
+
+const migrationKey = "workspace-interview-rounds-v1";
+const migrationComplete = db.prepare("SELECT 1 FROM app_metadata WHERE resource = 'migration' AND record_id = 1 AND value = ?").get(migrationKey);
+
+if (!migrationComplete) {
+  db.transaction(() => {
+    const workspaceColumns = tableColumns("workspaces");
+    if (workspaceColumns.has("interview_stage") || workspaceColumns.has("interview_date") || workspaceColumns.has("interviewers")) {
+      const stageColumn = workspaceColumns.has("interview_stage") ? "interview_stage" : "NULL AS interview_stage";
+      const dateColumn = workspaceColumns.has("interview_date") ? "interview_date" : "NULL AS interview_date";
+      const interviewersColumn = workspaceColumns.has("interviewers") ? "interviewers" : "NULL AS interviewers";
+      const legacyWorkspaces = db.prepare(`SELECT id, ${stageColumn}, ${dateColumn}, ${interviewersColumn} FROM workspaces`).all();
+      const insertRound = db.prepare(`
+        INSERT INTO interview_rounds (workspace_id, label, stage_type, scheduled_date, interviewers, sequence_order, status)
+        VALUES (?, ?, ?, ?, ?, 1, 'upcoming')
+      `);
+      for (const workspace of legacyWorkspaces) {
+        if (![workspace.interview_stage, workspace.interview_date, workspace.interviewers].some((value) => value != null && String(value).trim())) continue;
+        const label = workspace.interview_stage || "Round 1";
+        insertRound.run(workspace.id, label, inferStageType(label), workspace.interview_date || "", workspace.interviewers || "[]");
+      }
+    }
+
+    let workspace = db.prepare("SELECT * FROM workspaces ORDER BY id LIMIT 1").get();
+    if (!workspace) {
+      const settings = db.prepare("SELECT * FROM settings WHERE id = 1").get();
+      const result = db.prepare("INSERT INTO workspaces (company_name, role_title) VALUES (?, ?)")
+        .run(settings?.company_name || "Tempus", settings?.role_title || "");
+      workspace = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(result.lastInsertRowid);
+
+      let settingsUi = {};
+      const metadata = db.prepare("SELECT value FROM app_metadata WHERE resource = 'settings' AND record_id = 1").get();
+      try { settingsUi = metadata ? JSON.parse(metadata.value) : {}; } catch { settingsUi = {}; }
+      const label = settingsUi.interviewStage || "Round 1";
+      const hasLegacyRound = settings?.interview_date || (settings?.interviewers && settings.interviewers !== "[]") || settingsUi.interviewStage;
+      if (hasLegacyRound) {
+        db.prepare(`
+          INSERT INTO interview_rounds (workspace_id, label, stage_type, scheduled_date, interviewers, sequence_order, status)
+          VALUES (?, ?, ?, ?, ?, 1, 'upcoming')
+        `).run(workspace.id, label, inferStageType(label), settings?.interview_date || "", settings?.interviewers || "[]");
+      }
+    }
+
+    db.prepare(`
+      INSERT INTO app_metadata (resource, record_id, value) VALUES ('migration', 1, ?)
+      ON CONFLICT(resource, record_id) DO UPDATE SET value = excluded.value
+    `).run(migrationKey);
+  })();
+}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   MODULES,
   SCHEMA_VERSION,
@@ -6,6 +6,7 @@ import {
   createInitialData,
   createId,
   loadData,
+  loadRoundFilteredContent,
   moduleReadiness,
   overallReadiness,
   saveData,
@@ -18,19 +19,27 @@ import {
   uploadItemImage,
   deleteItemImage,
 } from "./data";
-import { FormattedTextarea, MarkdownContent } from "./markdown";
+import { RichTextEditor, MarkdownContent } from "./markdown";
+import { CASE_FRAMEWORK_STAGES } from "../caseFramework.js";
 
 const TYPE_LABELS = {
   note: "Note",
   pitch: "Pitch",
   question: "Question & answer",
   story: "Story",
+  "case-framework": "Case Framework",
   incident: "Incident",
   knowledge: "Knowledge",
   translation: "Translation",
   research: "Research",
   "open-question": "Open question",
 };
+const STORY_STAGES = Object.freeze([
+  { key: "situation", label: "Situation" },
+  { key: "task", label: "Task" },
+  { key: "action", label: "Action" },
+  { key: "result", label: "Result" },
+]);
 
 const ROUND_STAGE_TYPES = [
   ["recruiter_screen", "Recruiter screen"],
@@ -43,6 +52,8 @@ const ROUND_STAGE_TYPES = [
 ];
 const ROUND_STATUSES = ["upcoming", "completed", "cancelled"];
 const roundStageLabel = (stageType) => ROUND_STAGE_TYPES.find(([value]) => value === stageType)?.[1] || "Other";
+const RoundFilterContext = createContext({ activeRoundId: null, setActiveRoundId: () => {} });
+const useRoundFilter = () => useContext(RoundFilterContext);
 
 const isSchedulingOverview = (item) => item.module === "scheduling-machine"
   && item.title === "Platform overview and scale"
@@ -50,6 +61,7 @@ const isSchedulingOverview = (item) => item.module === "scheduling-machine"
 
 function itemMarkdownSections(item) {
   const content = item.content || {};
+  if (item.type === "case-framework") return CASE_FRAMEWORK_STAGES.map(({ key, label }) => [label, content[key]]);
   if (item.type === "story") return [
     ["Situation", content.situation],
     ["Task", content.task],
@@ -89,7 +101,7 @@ function ItemMarkdownContent({ item, emptyText = "No notes added yet." }) {
   const sections = itemMarkdownSections(item).filter(([, value]) => String(value || "").trim());
   if (!sections.length) return <p className="markdown-empty">{emptyText}</p>;
   return (
-    <div className={`markdown-sections ${sections.length > 1 ? "multiple" : ""}`}>
+    <div className={`markdown-sections ${sections.length > 1 ? "multiple" : ""} ${item.type === "case-framework" ? "case-framework-stages" : ""}`}>
       {sections.map(([label, value], index) => (
         <section key={`${label || "notes"}-${index}`}>
           {label && <b>{label}</b>}
@@ -100,23 +112,154 @@ function ItemMarkdownContent({ item, emptyText = "No notes added yet." }) {
   );
 }
 
-const makeItem = (moduleId) => {
+export function CombinedPreview({ title, metadata = null, sections = [] }) {
+  const populatedSections = sections.filter(({ content }) => String(content || "").trim());
+  return (
+    <section className="combined-preview">
+      <h2>{title || "Untitled item"}</h2>
+      {metadata && <div className="combined-preview-meta">{metadata}</div>}
+      <div className="combined-preview-flow">
+        {populatedSections.map(({ label, content }, index) => (
+          <section key={`${label}-${index}`}>
+            <span className="combined-preview-stage-label">{label}</span>
+            <MarkdownContent value={content} />
+          </section>
+        ))}
+        {populatedSections.length === 0 && <p className="markdown-empty">No stage content added yet.</p>}
+      </div>
+    </section>
+  );
+}
+
+function PreviewMetadata({ item, showStatus = false, showTags = false }) {
+  const statusLabel = STATUSES.find(({ value }) => value === item.status)?.label || String(item.status || "Not started").replaceAll("-", " ");
+  return <>
+    {showStatus && <span className={`status-select ${item.status || "not-started"}`}>{statusLabel}</span>}
+    {showTags && (item.tags || []).length > 0 && <span className="tag-preview">{item.tags.map((tag) => <i key={tag}>#{tag}</i>)}</span>}
+  </>;
+}
+
+function sectionsFromStageConfig(item, stageConfig = []) {
+  const content = item.content || {};
+  return stageConfig.map(({ key, label }) => ({ label, content: content[key] || "" }));
+}
+
+function previewShapeForItem(item, stageConfig = []) {
+  const content = item.content || {};
+  if (item.type === "story") return {
+    title: item.title,
+    metadata: <PreviewMetadata item={item} showStatus showTags />,
+    sections: sectionsFromStageConfig(item, stageConfig),
+  };
+  if (item.type === "case-framework") return {
+    title: item.title,
+    metadata: <PreviewMetadata item={item} showStatus showTags />,
+    sections: [
+      { label: "Case Study", content: (item.usedFor || []).join("\n") },
+      ...sectionsFromStageConfig(item, stageConfig),
+    ],
+  };
+  if (item.type === "question") return {
+    title: item.title,
+    metadata: <PreviewMetadata item={item} showStatus />,
+    sections: [{ label: "My Answer", content: content.notes || "" }],
+  };
+  if (item.type === "incident") return {
+    title: item.title,
+    metadata: (item.tags || []).length > 0 ? <PreviewMetadata item={item} showTags /> : null,
+    sections: [
+      { label: "What Broke", content: content.whatBroke ?? content.notes ?? "" },
+      { label: "How Found", content: content.howFound || "" },
+      { label: "How Fixed", content: content.howFixed || "" },
+      { label: "What Changed After", content: content.whatChangedAfter || "" },
+    ],
+  };
+  if (item.type === "translation") {
+    const pattern = String(content.schedulingMachinePattern || "").trim();
+    return {
+      title: pattern ? `${pattern.slice(0, 60)}${pattern.length > 60 ? "…" : ""}` : "Translation map",
+      sections: [
+        { label: "Scheduling Machine Pattern", content: content.schedulingMachinePattern || "" },
+        { label: "Tempus Problem", content: content.tempusProblem || "" },
+        { label: "What I'd Bring", content: content.whatIBring || "" },
+      ],
+    };
+  }
+  if (item.type === "knowledge") return {
+    title: item.title,
+    metadata: (item.tags || []).length > 0 ? <PreviewMetadata item={item} showTags /> : null,
+    sections: [
+      { label: "Definition", content: content.definition ?? content.notes ?? "" },
+      { label: "Notes", content: content.definition == null ? "" : content.notes || "" },
+    ],
+  };
+  return {
+    title: item.title,
+    metadata: <PreviewMetadata item={item} showStatus showTags />,
+    sections: [{ label: "Notes", content: content.notes || "" }],
+  };
+}
+
+function previewShapeForTree(tree) {
+  const nodes = [...(tree.nodes || [])].sort((a, b) => a.level - b.level);
+  const root = nodes.find((node) => node.level === 0) || nodes[0];
+  return {
+    title: root?.question || tree.title || "Untitled drill tree",
+    sections: nodes.filter((node) => node !== root).map((node) => {
+      const question = String(node.question || "").trim();
+      const answer = String(node.myAnswer || "").trim();
+      return {
+        label: `Level ${node.level} follow-up`,
+        content: [question && `**Q:** ${question}`, answer && `**A:** ${answer}`].filter(Boolean).join("\n\n"),
+      };
+    }),
+  };
+}
+
+function CombinedPreviewModal({ preview, close }) {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event) => event.key === "Escape" && close();
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [close]);
+  return (
+    <div className="dialog-backdrop combined-preview-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <section className="combined-preview-dialog" role="dialog" aria-modal="true" aria-label={`Preview: ${preview.title || "Untitled item"}`}>
+        <button type="button" className="dialog-close" onClick={close} aria-label="Close item preview">×</button>
+        <CombinedPreview {...preview} />
+      </section>
+    </div>
+  );
+}
+
+const makeItem = (moduleId, itemType = "question", workspaceId = null, roundId = null) => {
   const timestamp = new Date().toISOString();
+  const isCaseFramework = itemType === "case-framework";
+  const isStory = itemType === "story";
   return {
     id: createId(),
-    type: moduleId === "data-platform-translation" ? "translation" : "note",
+    type: itemType,
+    itemType: isCaseFramework ? "case_framework" : isStory ? "story" : "question",
+    workspaceId: isCaseFramework ? workspaceId : null,
     module: moduleId,
-    title: "Untitled prep item",
+    title: isCaseFramework ? "Untitled case framework" : isStory ? "Untitled story" : "Untitled question",
     tags: [],
+    usedFor: [],
     status: "not-started",
     priority: "medium",
     starred: false,
     sortOrder: Date.now(),
     createdAt: timestamp,
     updatedAt: timestamp,
-    content: moduleId === "data-platform-translation"
-      ? { notes: "", schedulingMachinePattern: "", tempusProblem: "", whatIBring: "" }
-      : { notes: "" },
+    roundIds: roundId == null ? [] : [roundId],
+    content: isCaseFramework
+      ? Object.fromEntries(CASE_FRAMEWORK_STAGES.map(({ key }) => [key, ""]))
+      : isStory ? { situation: "", task: "", action: "", result: "" } : { notes: "" },
   };
 };
 
@@ -126,6 +269,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [saveState, setSaveState] = useState("Loading…");
   const [notice, setNotice] = useState("");
+  const [activeRoundId, setActiveRoundIdState] = useState(null);
   const importRef = useRef(null);
   const hydrated = useRef(false);
   const modules = useMemo(() => data.settings.preparationModules || MODULES, [data.settings.preparationModules]);
@@ -254,8 +398,8 @@ function App() {
     setNotice("Item duplicated");
   };
 
-  const addItem = (moduleId) => {
-    const item = makeItem(moduleId);
+  const addItem = (moduleId, itemType = "question") => {
+    const item = makeItem(moduleId, itemType, data.activeWorkspaceId, activeRoundId);
     setData((current) => ({ ...current, items: [...current.items, item] }));
     window.setTimeout(() => document.getElementById(`item-${item.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
   };
@@ -311,14 +455,34 @@ function App() {
     }
   };
 
+  const changeRoundFilter = async (roundId) => {
+    const nextRoundId = Number.isInteger(roundId) && roundId > 0 ? roundId : null;
+    if (nextRoundId === activeRoundId) return;
+    setSaveState("Loading…");
+    try {
+      await saveData(data);
+      const content = await loadRoundFilteredContent(nextRoundId, data.activeWorkspaceId);
+      setActiveRoundIdState(nextRoundId);
+      setData((current) => ({ ...current, ...content }));
+      setSaveState("Saved to SQLite");
+    } catch (error) {
+      console.error(error);
+      setSaveState("Load failed");
+      setNotice("Round filter could not be applied");
+    }
+  };
+
   const selectWorkspace = async (workspaceId) => {
     const workspace = data.workspaces.find((entry) => entry.id === workspaceId);
     if (!workspace || workspaceId === data.activeWorkspaceId) return;
     setSaveState("Loading…");
     try {
-      const rounds = await loadWorkspaceRounds(workspaceId);
+      await saveData(data);
+      const [rounds, content] = await Promise.all([loadWorkspaceRounds(workspaceId), loadRoundFilteredContent(null, workspaceId)]);
+      setActiveRoundIdState(null);
       setData((current) => ({
         ...current,
+        ...content,
         activeWorkspaceId: workspaceId,
         rounds,
         settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle },
@@ -334,9 +498,13 @@ function App() {
 
   const addWorkspace = async () => {
     try {
+      await saveData(data);
       const workspace = await createWorkspace({ companyName: "New opportunity", roleTitle: "" });
+      const content = await loadRoundFilteredContent(null, workspace.id);
+      setActiveRoundIdState(null);
       setData((current) => ({
         ...current,
+        ...content,
         workspaces: [...current.workspaces, workspace],
         activeWorkspaceId: workspace.id,
         rounds: [],
@@ -396,11 +564,16 @@ function App() {
   const removeRound = async (round) => {
     if (!window.confirm(`Delete “${round.label}”? Its drill trees will become general preparation.`)) return false;
     try {
+      await saveData(data);
       await deleteInterviewRound(data.activeWorkspaceId, round.id);
+      const content = activeRoundId === round.id ? await loadRoundFilteredContent(null, data.activeWorkspaceId) : null;
+      if (activeRoundId === round.id) setActiveRoundIdState(null);
       setData((current) => ({
         ...current,
+        ...(content || {}),
         rounds: current.rounds.filter((entry) => entry.id !== round.id),
-        drillTrees: current.drillTrees.map((tree) => tree.roundId === round.id ? { ...tree, roundId: null } : tree),
+        items: (content?.items || current.items).map((item) => ({ ...item, roundIds: (item.roundIds || []).filter((id) => id !== round.id) })),
+        drillTrees: (content?.drillTrees || current.drillTrees).map((tree) => tree.roundId === round.id ? { ...tree, roundId: null } : tree),
       }));
       setNotice("Interview round deleted; its drill trees are now general prep");
       return true;
@@ -510,6 +683,7 @@ function App() {
   const module = modules.find((entry) => entry.id === view);
 
   return (
+    <RoundFilterContext.Provider value={{ activeRoundId, setActiveRoundId: changeRoundFilter }}>
     <div className="app-shell">
       <Sidebar view={view} data={data} modules={modules} onNavigate={navigate} />
       <div className="workspace">
@@ -519,6 +693,7 @@ function App() {
           setQuery={setQuery}
           saveState={saveState}
           onNavigate={navigate}
+          rounds={data.rounds}
         />
         {query.trim() ? (
           <SearchResults query={query} results={searchResults} modules={modules} onNavigate={navigate} />
@@ -569,6 +744,7 @@ function App() {
       <input ref={importRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={importData} />
       {notice && <div className="toast" role="status">{notice}</div>}
     </div>
+    </RoundFilterContext.Provider>
   );
 }
 
@@ -606,7 +782,8 @@ function Sidebar({ view, data, modules, onNavigate }) {
   );
 }
 
-function Header({ company, query, setQuery, saveState, onNavigate }) {
+function Header({ company, query, setQuery, saveState, onNavigate, rounds }) {
+  const { activeRoundId, setActiveRoundId } = useRoundFilter();
   return (
     <header className="topbar">
       <label className="search-box">
@@ -614,6 +791,7 @@ function Header({ company, query, setQuery, saveState, onNavigate }) {
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search questions, answers, tags, and notes…" aria-label="Search all preparation content" />
         <kbd>⌘ K</kbd>
       </label>
+      <label className="global-round-filter"><span className="visually-hidden">Filter by interview round</span><select value={activeRoundId ?? ""} onChange={(event) => setActiveRoundId(event.target.value ? Number(event.target.value) : null)}><option value="">All rounds</option>{rounds.map((round) => <option value={round.id} key={round.id}>{round.label}</option>)}</select></label>
       <span className={`save-state ${saveState.endsWith("failed") ? "error" : ""}`}><i />{saveState}</span>
       <button className="company-chip" onClick={() => onNavigate("settings")}>{company || "Set company"}</button>
     </header>
@@ -621,6 +799,8 @@ function Header({ company, query, setQuery, saveState, onNavigate }) {
 }
 
 function Dashboard({ data, modules, onNavigate }) {
+  const { activeRoundId, setActiveRoundId } = useRoundFilter();
+  const activeRound = data.rounds.find((round) => round.id === activeRoundId) || null;
   const overall = overallReadiness(data, modules);
   const focus = useMemo(() => {
     const rank = (item) => {
@@ -668,7 +848,7 @@ function Dashboard({ data, modules, onNavigate }) {
           </div>
         </article>
         <article className="panel focus-card">
-          <div className="panel-heading"><div><p className="eyebrow">Focus today</p><h2>Highest-leverage work</h2></div><span className="count-pill">{focus.length}</span></div>
+          <div className="panel-heading"><div><p className="eyebrow">Focus today</p><h2>Highest-leverage work</h2>{activeRound && <FilterIndicator round={activeRound} clear={() => setActiveRoundId(null)} />}</div><span className="count-pill">{focus.length}</span></div>
           <div className="focus-list">
             {focus.slice(0, 4).map((item) => {
               const module = modules.find((entry) => entry.id === item.module);
@@ -685,15 +865,15 @@ function Dashboard({ data, modules, onNavigate }) {
       </section>
 
       <section className="rounds-timeline panel">
-        <div className="panel-heading"><div><p className="eyebrow">Interview plan</p><h2>Rounds timeline</h2></div><button className="text-button" onClick={() => onNavigate("settings")}>Manage rounds →</button></div>
+        <div className="panel-heading"><div><p className="eyebrow">Interview plan</p><h2>Rounds timeline</h2></div><div className="timeline-actions"><button className={`round-filter-clear ${activeRoundId == null ? "active" : ""}`} onClick={() => setActiveRoundId(null)}>All rounds</button><button className="text-button" onClick={() => onNavigate("settings")}>Manage rounds →</button></div></div>
         {rounds.length === 0 ? <p className="muted">No interview rounds added yet.</p> : (
           <ol>
             {rounds.map((round, index) => (
-              <li key={round.id} className={`round-timeline-item ${round.status}`}>
+              <li key={round.id}><button type="button" onClick={() => setActiveRoundId(round.id)} className={`round-timeline-item ${round.status} ${activeRoundId === round.id ? "selected" : ""}`} aria-pressed={activeRoundId === round.id}>
                 <span className="round-sequence">{index + 1}</span>
                 <div><strong>{round.label}</strong><small>{roundStageLabel(round.stageType)} · {round.scheduledDate ? formatDate(round.scheduledDate) : "Date not set"}</small></div>
                 <span className={`round-status ${round.status}`}>{round.status}</span>
-              </li>
+              </button></li>
             ))}
           </ol>
         )}
@@ -724,12 +904,9 @@ function Dashboard({ data, modules, onNavigate }) {
 
 function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateItem, addItem, saveNow, addImagesToItem, removeImageFromItem, updateTree, addTree, deleteTree, saveRound }) {
   const items = data.items.filter((item) => item.module === module.id).sort((a, b) => a.sortOrder - b.sortOrder);
-  const [selectedRoundId, setSelectedRoundId] = useState(null);
+  const { activeRoundId: selectedRoundId, setActiveRoundId: setSelectedRoundId } = useRoundFilter();
   const isSimulation = module.id === "hiring-manager-simulation";
   const selectedRound = data.rounds.find((round) => round.id === selectedRoundId) || null;
-  useEffect(() => {
-    if (selectedRoundId != null && !data.rounds.some((round) => round.id === selectedRoundId)) setSelectedRoundId(null);
-  }, [data.rounds, selectedRoundId]);
   const moduleTrees = data.drillTrees.filter((tree) => tree.module === module.id);
   const trees = isSimulation
     ? moduleTrees.filter((tree) => tree.roundId == null || (selectedRoundId != null && tree.roundId === selectedRoundId))
@@ -742,6 +919,7 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
         <div><p className="eyebrow">Preparation module</p><h1>{module.label}</h1><p>{module.description}</p></div>
         <div className="module-score"><strong>{progress ?? 0}%</strong><span>readiness</span></div>
       </section>
+      {selectedRound && <FilterIndicator round={selectedRound} clear={() => setSelectedRoundId(null)} className="module-filter-indicator" />}
       {isSimulation && (
         <section className="round-context-panel panel">
           <div><p className="eyebrow">Round context</p><h2>Simulation focus</h2><p>General preparation is always included alongside the selected interview round.</p></div>
@@ -749,10 +927,15 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
         </section>
       )}
       {isSimulation && selectedRound && <RoundPreparation round={selectedRound} saveRound={saveRound} />}
-      <div className="section-heading content-heading"><div><p className="eyebrow">Working set</p><h2>Your preparation items</h2></div><button className="primary-button" onClick={() => addItem(module.id)}>＋ Add item</button></div>
+      <div className="section-heading content-heading preparation-items-heading">
+        <div><p className="eyebrow">Working set</p><h2>Your preparation items</h2></div>
+        <div className="preparation-item-actions">
+          <button className="primary-button" onClick={() => addItem(module.id, "question")}>＋ New Item</button>
+        </div>
+      </div>
       <section className="item-list">
-        {items.length === 0 && <EmptyState onAdd={() => addItem(module.id)} />}
-        {items.map((item, index) => <ItemEditor key={item.id} item={item} module={module} updateItem={updateItem} moveItem={moveItem} canMoveUp={index > 0} canMoveDown={index < items.length - 1} deleteItem={deleteItem} duplicateItem={duplicateItem} saveNow={saveNow} addImagesToItem={addImagesToItem} removeImageFromItem={removeImageFromItem} />)}
+        {items.length === 0 && <EmptyState onAdd={() => addItem(module.id, "question")} />}
+        {items.map((item, index) => <ItemEditor key={item.id} item={item} module={module} rounds={data.rounds} workspaceId={data.activeWorkspaceId} stageConfig={item.type === "case-framework" ? CASE_FRAMEWORK_STAGES : item.type === "story" ? STORY_STAGES : null} updateItem={updateItem} moveItem={moveItem} canMoveUp={index > 0} canMoveDown={index < items.length - 1} deleteItem={deleteItem} duplicateItem={duplicateItem} saveNow={saveNow} addImagesToItem={addImagesToItem} removeImageFromItem={removeImageFromItem} />)}
       </section>
       {(module.id === "hiring-manager-simulation" || trees.length > 0) && (
         <DrillSection module={module} trees={trees} updateTree={updateTree} addTree={addTree} deleteTree={deleteTree} roundId={isSimulation ? selectedRoundId : null} rounds={data.rounds} />
@@ -768,8 +951,8 @@ function RoundPreparation({ round, saveRound }) {
     <section className="round-preparation panel">
       <div className="section-heading"><div><p className="eyebrow">{round.label}</p><h2>Round-specific preparation</h2></div><button type="button" className="primary-button" onClick={() => saveRound(draft)}>Save round notes</button></div>
       <div className="round-preparation-grid">
-        <FormattedTextarea label="Interviewer research" value={draft.interviewerNotes || ""} onChange={(value) => setDraft((current) => ({ ...current, interviewerNotes: value }))} placeholder="Background, communication style, mutual connections…" />
-        <FormattedTextarea label="Questions to ask" value={draft.questionsToAsk || ""} onChange={(value) => setDraft((current) => ({ ...current, questionsToAsk: value }))} placeholder="Questions tailored to this round…" />
+        <RichTextEditor label="Interviewer research" value={draft.interviewerNotes || ""} onChange={(value) => setDraft((current) => ({ ...current, interviewerNotes: value }))} placeholder="Background, communication style, mutual connections…" />
+        <RichTextEditor label="Questions to ask" value={draft.questionsToAsk || ""} onChange={(value) => setDraft((current) => ({ ...current, questionsToAsk: value }))} placeholder="Questions tailored to this round…" />
       </div>
     </section>
   );
@@ -783,7 +966,7 @@ function FormattedListEditor({ label, values = [], onChange, addLabel }) {
       <span className="formatted-field-label">{label}</span>
       {values.map((value, index) => (
         <div className="formatted-list-entry" key={`${label}-${index}`}>
-          <FormattedTextarea label={`${label} ${index + 1}`} value={value} onChange={(nextValue) => updateEntry(index, nextValue)} />
+          <RichTextEditor label={`${label} ${index + 1}`} value={value} onChange={(nextValue) => updateEntry(index, nextValue)} />
           <button type="button" className="danger-link" onClick={() => removeEntry(index)}>Remove</button>
         </div>
       ))}
@@ -792,53 +975,88 @@ function FormattedListEditor({ label, values = [], onChange, addLabel }) {
   );
 }
 
-function ItemLongTextFields({ item, setContent }) {
+function StagedNarrativeFields({ item, setContent, stageConfig }) {
   const content = item.content || {};
-  if (item.type === "story") return (
-    <div className="long-text-stack">
-      <FormattedTextarea label="Situation" value={content.situation || ""} onChange={(value) => setContent("situation", value)} />
-      <FormattedTextarea label="Task" value={content.task || ""} onChange={(value) => setContent("task", value)} />
-      <FormattedTextarea label="Action" value={content.action ?? content.notes ?? ""} onChange={(value) => setContent("action", value)} />
-      <FormattedTextarea label="Result" value={content.result || ""} onChange={(value) => setContent("result", value)} />
+  return (
+    <div className="long-text-stack staged-narrative-fields">
+      {stageConfig.map(({ key, label, demonstrates }) => <RichTextEditor key={key} label={label} helperText={demonstrates} value={content[key] || ""} onChange={(value) => setContent(key, value)} />)}
     </div>
   );
+}
+
+function StoryForm({ item, setContent, stageConfig = STORY_STAGES }) {
+  return <StagedNarrativeFields item={item} setContent={setContent} stageConfig={stageConfig} />;
+}
+
+function CaseFrameworkForm({ item, setContent, stageConfig = CASE_FRAMEWORK_STAGES }) {
+  return <StagedNarrativeFields item={item} setContent={setContent} stageConfig={stageConfig} />;
+}
+
+function ItemLongTextFields({ item, setContent, stageConfig }) {
+  const content = item.content || {};
+  if (item.type === "story") return <StoryForm item={item} setContent={setContent} stageConfig={stageConfig || undefined} />;
+  if (item.type === "case-framework") return <CaseFrameworkForm item={item} setContent={setContent} stageConfig={stageConfig || undefined} />;
   if (item.type === "incident") return (
     <div className="long-text-stack">
-      <FormattedTextarea label="What broke" value={content.whatBroke ?? content.notes ?? ""} onChange={(value) => setContent("whatBroke", value)} />
-      <FormattedTextarea label="How it was found" value={content.howFound || ""} onChange={(value) => setContent("howFound", value)} />
-      <FormattedTextarea label="How it was fixed" value={content.howFixed || ""} onChange={(value) => setContent("howFixed", value)} />
-      <FormattedTextarea label="What changed afterward" value={content.whatChangedAfter || ""} onChange={(value) => setContent("whatChangedAfter", value)} />
+      <RichTextEditor label="What broke" value={content.whatBroke ?? content.notes ?? ""} onChange={(value) => setContent("whatBroke", value)} />
+      <RichTextEditor label="How it was found" value={content.howFound || ""} onChange={(value) => setContent("howFound", value)} />
+      <RichTextEditor label="How it was fixed" value={content.howFixed || ""} onChange={(value) => setContent("howFixed", value)} />
+      <RichTextEditor label="What changed afterward" value={content.whatChangedAfter || ""} onChange={(value) => setContent("whatChangedAfter", value)} />
     </div>
   );
   if (item.type === "translation") return (
     <div className="translation-grid formatted-translation-grid">
-      <FormattedTextarea label="Scheduling Machine pattern" value={content.schedulingMachinePattern || ""} onChange={(value) => setContent("schedulingMachinePattern", value)} />
-      <FormattedTextarea label="Analogous Tempus problem" value={content.tempusProblem || ""} onChange={(value) => setContent("tempusProblem", value)} />
-      <FormattedTextarea label="What I would bring" value={content.whatIBring || ""} onChange={(value) => setContent("whatIBring", value)} />
+      <RichTextEditor label="Scheduling Machine pattern" value={content.schedulingMachinePattern || ""} onChange={(value) => setContent("schedulingMachinePattern", value)} />
+      <RichTextEditor label="Analogous Tempus problem" value={content.tempusProblem || ""} onChange={(value) => setContent("tempusProblem", value)} />
+      <RichTextEditor label="What I would bring" value={content.whatIBring || ""} onChange={(value) => setContent("whatIBring", value)} />
     </div>
   );
   if (item.type === "knowledge") return (
     <div className="long-text-stack">
-      <FormattedTextarea label="Definition" value={content.definition ?? content.notes ?? ""} onChange={(value) => setContent("definition", value)} />
-      <FormattedTextarea label="Notes" value={content.definition == null ? "" : content.notes || ""} onChange={(value) => setContent("notes", value)} />
+      <RichTextEditor label="Definition" value={content.definition ?? content.notes ?? ""} onChange={(value) => setContent("definition", value)} />
+      <RichTextEditor label="Notes" value={content.definition == null ? "" : content.notes || ""} onChange={(value) => setContent("notes", value)} />
     </div>
   );
   if (isSchedulingOverview(item)) return (
     <div className="long-text-stack">
-      <FormattedTextarea label="Overview" value={content.overview ?? content.notes ?? ""} onChange={(value) => setContent("overview", value)} textareaClassName="main-textarea" />
+      <RichTextEditor label="Overview" value={content.overview ?? content.notes ?? ""} onChange={(value) => setContent("overview", value)} textareaClassName="main-textarea" />
       <FormattedListEditor label="Architecture note" values={content.architectureNotes || []} onChange={(value) => setContent("architectureNotes", value)} addLabel="Add architecture note" />
       <FormattedListEditor label="Ownership story" values={content.ownershipStories || []} onChange={(value) => setContent("ownershipStories", value)} addLabel="Add ownership story" />
-      <FormattedTextarea label="Scale metrics" value={content.scaleMetrics || ""} onChange={(value) => setContent("scaleMetrics", value)} />
-      <FormattedTextarea label="Lessons learned" value={content.lessonsLearned || ""} onChange={(value) => setContent("lessonsLearned", value)} />
+      <RichTextEditor label="Scale metrics" value={content.scaleMetrics || ""} onChange={(value) => setContent("scaleMetrics", value)} />
+      <RichTextEditor label="Lessons learned" value={content.lessonsLearned || ""} onChange={(value) => setContent("lessonsLearned", value)} />
     </div>
   );
-  return <FormattedTextarea label="Notes / prepared answer" value={content.notes || ""} onChange={(value) => setContent("notes", value)} textareaClassName="main-textarea" placeholder="Capture the answer, evidence, trade-offs, and details you need on recall…" />;
+  return <RichTextEditor label="Notes / prepared answer" value={content.notes || ""} onChange={(value) => setContent("notes", value)} textareaClassName="main-textarea" placeholder="Capture the answer, evidence, trade-offs, and details you need on recall…" />;
 }
 
-function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown, deleteItem, duplicateItem, saveNow, addImagesToItem, removeImageFromItem }) {
-  const [open, setOpen] = useState(item.title === "Untitled prep item");
+function FilterIndicator({ round, clear, className = "" }) {
+  return <button type="button" className={`filter-indicator ${className}`} onClick={clear}>Filtered: {round.label} <span aria-hidden="true">×</span><span className="visually-hidden"> Clear round filter</span></button>;
+}
+
+function RoundTagPicker({ rounds, value = [], onChange }) {
+  const selected = Array.isArray(value) ? value : [];
+  return (
+    <fieldset className="round-tag-picker">
+      <legend>Interview rounds</legend>
+      <div className="round-tag-chips">
+        {rounds.length === 0 ? <small>Add interview rounds in Settings to tag this item.</small> : rounds.map((round) => {
+          const checked = selected.includes(round.id);
+          return <button type="button" key={round.id} className={checked ? "selected" : ""} aria-pressed={checked} onClick={() => onChange(checked ? selected.filter((id) => id !== round.id) : [...selected, round.id])}>{checked ? "✓ " : "+ "}{round.label}</button>;
+        })}
+      </div>
+      <small>{selected.length === 0 ? "General preparation — visible for every round." : "This item appears for each selected round."}</small>
+    </fieldset>
+  );
+}
+
+function ItemEditor({ item, module, rounds, workspaceId, stageConfig, updateItem, moveItem, canMoveUp, canMoveDown, deleteItem, duplicateItem, saveNow, addImagesToItem, removeImageFromItem }) {
+  const [open, setOpen] = useState(item.title.startsWith("Untitled"));
   const [tagInput, setTagInput] = useState(() => (item.tags || []).join(", "));
   const [previewImage, setPreviewImage] = useState(null);
+  const [formMode, setFormMode] = useState("edit");
+  const [combinedPreviewOpen, setCombinedPreviewOpen] = useState(false);
+  const supportsCombinedPreview = !isSchedulingOverview(item);
+  const combinedPreview = previewShapeForItem(item, stageConfig || []);
   useEffect(() => {
     if (!previewImage) return undefined;
     const previousOverflow = document.body.style.overflow;
@@ -850,6 +1068,9 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [previewImage]);
+  useEffect(() => {
+    if (!supportsCombinedPreview) setFormMode("edit");
+  }, [supportsCombinedPreview]);
   const setContent = (key, value) => updateItem(item.id, { content: { ...item.content, [key]: value } });
   return (
     <article id={`item-${item.id}`} className={`item-card ${open ? "open" : ""}`}>
@@ -863,6 +1084,7 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
           <button disabled={!canMoveUp} onClick={() => moveItem(item.id, -1)} aria-label={`Move ${item.title} up`}>↑</button>
           <button disabled={!canMoveDown} onClick={() => moveItem(item.id, 1)} aria-label={`Move ${item.title} down`}>↓</button>
         </span>
+        {supportsCombinedPreview && <button type="button" className="item-preview-button" onClick={() => setCombinedPreviewOpen(true)} aria-label={`Preview ${item.title}`} title="Preview">◉ <span>Preview</span></button>}
         <select className={`status-select ${item.status}`} value={item.status} onChange={(event) => updateItem(item.id, { status: event.target.value })} aria-label={`Status for ${item.title}`}>
           {STATUSES.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}
         </select>
@@ -870,9 +1092,17 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
       </div>
       {open && (
         <div className="item-form">
+          {supportsCombinedPreview && <div className="item-form-mode" role="group" aria-label="Item form mode">
+            <button type="button" className={formMode === "edit" ? "active" : ""} aria-pressed={formMode === "edit"} onClick={() => setFormMode("edit")}>Edit</button>
+            <button type="button" className={formMode === "preview" ? "active" : ""} aria-pressed={formMode === "preview"} onClick={() => setFormMode("preview")}>Preview</button>
+          </div>}
+          {(!supportsCombinedPreview || formMode === "edit") && <>
           <div className="form-grid three">
             <label>Title<input value={item.title} onChange={(event) => updateItem(item.id, { title: event.target.value })} /></label>
-            <label>Type<select value={item.type} onChange={(event) => updateItem(item.id, { type: event.target.value })}>{Object.entries(TYPE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+            <label>Type<select value={item.type} onChange={(event) => {
+              const type = event.target.value;
+              updateItem(item.id, { type, itemType: type === "case-framework" ? "case_framework" : type === "story" ? "story" : item.itemType, workspaceId: type === "case-framework" ? workspaceId : item.workspaceId });
+            }}>{Object.entries(TYPE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
             <label>Priority<select value={item.priority} onChange={(event) => updateItem(item.id, { priority: event.target.value })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
           </div>
           <label>Tags<input value={tagInput} onChange={(event) => {
@@ -880,6 +1110,9 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
             setTagInput(value);
             updateItem(item.id, { tags: value.split(",").map((tag) => tag.trim()).filter(Boolean) });
           }} placeholder="must-review, architecture, leadership" /></label>
+          {!isSchedulingOverview(item) && <RoundTagPicker rounds={rounds} value={item.roundIds} onChange={(roundIds) => updateItem(item.id, { roundIds })} />}
+          {item.type === "story" && <label>Used for<input value={(item.usedFor || []).join(", ")} onChange={(event) => updateItem(item.id, { usedFor: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} placeholder="Leadership, product sense, execution" /></label>}
+          {item.type === "case-framework" && <RichTextEditor label="Case Study" value={(item.usedFor || []).join("\n")} onChange={(value) => updateItem(item.id, { usedFor: value ? [value] : [] })} />}
           {item.type === "research" && (
             <div className="form-grid three">
               <label>Source title<input value={item.content.sourceTitle || ""} onChange={(event) => setContent("sourceTitle", event.target.value)} /></label>
@@ -887,7 +1120,7 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
               <label>Claim type<select value={item.content.claimType || "fact"} onChange={(event) => setContent("claimType", event.target.value)}><option value="fact">Fact</option><option value="inference">Inference</option><option value="hypothesis">Hypothesis</option></select></label>
             </div>
           )}
-          <ItemLongTextFields item={item} setContent={setContent} />
+          <ItemLongTextFields item={item} setContent={setContent} stageConfig={stageConfig} />
           <section className="item-images">
             <div className="item-images-heading"><span>Images</span><small>.jpg, .jpeg, .png, .gif, .svg, .heic · 12 MB maximum each</small></div>
             {(item.images || []).length > 0 && <div className="image-preview-grid">
@@ -913,6 +1146,8 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
               }} />
             </label>
           </section>
+          </>}
+          {supportsCombinedPreview && formMode === "preview" && <CombinedPreview {...combinedPreview} />}
           <div className="item-actions">
             <span>Updated {new Date(item.updatedAt).toLocaleString()}</span>
             <button className="save-link" onClick={() => saveNow()}>Save</button>
@@ -935,6 +1170,7 @@ function ItemEditor({ item, module, updateItem, moveItem, canMoveUp, canMoveDown
           </section>
         </div>
       )}
+      {combinedPreviewOpen && <CombinedPreviewModal preview={combinedPreview} close={() => setCombinedPreviewOpen(false)} />}
     </article>
   );
 }
@@ -944,39 +1180,59 @@ function DrillSection({ module, trees, updateTree, addTree, deleteTree, roundId 
   return (
     <section className="drill-section">
       <div className="section-heading"><div><p className="eyebrow">Progressive drilling</p><h2>Follow-up depth</h2></div><button className="primary-button" onClick={() => addTree(module.id, roundId)}>＋ Add drill tree</button></div>
-      {trees.length === 0 ? <p className="muted">No drill trees are assigned to this module yet.</p> : trees.map((tree) => (
-        <article className="drill-card" key={tree.id}>
-          <div className="drill-heading">
-            <div><small>{tree.nodes.length} levels · {tree.roundId == null ? "General prep" : rounds.find((round) => round.id === tree.roundId)?.label || "Interview round"}</small><input className="drill-title-input" value={tree.title} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, title: event.target.value }))} aria-label="Drill tree title" /></div>
-            <div className="drill-actions"><button className="danger-link" onClick={() => deleteTree(tree.id)}>Delete</button><button className="secondary-button" onClick={() => setPracticeTree(tree)}>Practice tree →</button></div>
-          </div>
-          <div className="drill-nodes">
-            {tree.nodes.map((node, index) => (
-              <div className="drill-node" key={node.id} style={{ marginLeft: `${node.level * 28}px` }}>
-                <span className="level-badge">L{node.level}</span>
-                <label><span className="visually-hidden">Question level {node.level}</span><input value={node.question} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, question: event.target.value } : entry) }))} /></label>
-                <select value={node.status} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, status: event.target.value } : entry) }))} aria-label={`Status for level ${index}`}>
-                  {STATUSES.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}
-                </select>
-              </div>
-            ))}
-          </div>
-          <button className="add-followup" onClick={() => updateTree(tree.id, (current) => ({
-            ...current,
-            nodes: [...current.nodes, {
-              id: createId(),
-              parentId: current.nodes.at(-1)?.id ?? null,
-              level: current.nodes.length,
-              question: "New follow-up question",
-              myAnswer: "",
-              status: "not-started",
-              sortOrder: current.nodes.length,
-            }],
-          }))}>＋ Add follow-up level</button>
-        </article>
-      ))}
+      {trees.length === 0 ? <p className="muted">No drill trees are assigned to this module yet.</p> : trees.map((tree) => <DrillCard key={tree.id} tree={tree} rounds={rounds} updateTree={updateTree} deleteTree={deleteTree} practice={() => setPracticeTree(tree)} />)}
       {practiceTree && <PracticeDialog tree={practiceTree} close={() => setPracticeTree(null)} updateTree={updateTree} />}
     </section>
+  );
+}
+
+function DrillCard({ tree, rounds, updateTree, deleteTree, practice }) {
+  const [mode, setMode] = useState("edit");
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const preview = previewShapeForTree(tree);
+  return (
+    <article className="drill-card">
+      <div className="drill-card-controls">
+        <div className="item-form-mode" role="group" aria-label="Drill tree form mode">
+          <button type="button" className={mode === "edit" ? "active" : ""} aria-pressed={mode === "edit"} onClick={() => setMode("edit")}>Edit</button>
+          <button type="button" className={mode === "preview" ? "active" : ""} aria-pressed={mode === "preview"} onClick={() => setMode("preview")}>Preview</button>
+        </div>
+        <div className="drill-actions">
+          <button type="button" className="item-preview-button" onClick={() => setPreviewOpen(true)} aria-label={`Preview ${preview.title}`} title="Preview">◉ <span>Preview</span></button>
+          <button className="danger-link" onClick={() => deleteTree(tree.id)}>Delete</button>
+          <button className="secondary-button" onClick={practice}>Practice tree →</button>
+        </div>
+      </div>
+      {mode === "edit" ? <>
+        <div className="drill-heading">
+          <div><small>{tree.nodes.length} levels · {tree.roundId == null ? "General prep" : rounds.find((round) => round.id === tree.roundId)?.label || "Interview round"}</small><input className="drill-title-input" value={tree.title} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, title: event.target.value }))} aria-label="Drill tree title" /></div>
+        </div>
+        <div className="drill-nodes">
+          {tree.nodes.map((node, index) => (
+            <div className="drill-node" key={node.id} style={{ marginLeft: `${node.level * 28}px` }}>
+              <span className="level-badge">L{node.level}</span>
+              <label><span className="visually-hidden">Question level {node.level}</span><input value={node.question} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, question: event.target.value } : entry) }))} /></label>
+              <select value={node.status} onChange={(event) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, status: event.target.value } : entry) }))} aria-label={`Status for level ${index}`}>
+                {STATUSES.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+        <button className="add-followup" onClick={() => updateTree(tree.id, (current) => ({
+          ...current,
+          nodes: [...current.nodes, {
+            id: createId(),
+            parentId: current.nodes.at(-1)?.id ?? null,
+            level: current.nodes.length,
+            question: "New follow-up question",
+            myAnswer: "",
+            status: "not-started",
+            sortOrder: current.nodes.length,
+          }],
+        }))}>＋ Add follow-up level</button>
+      </> : <CombinedPreview {...preview} />}
+      {previewOpen && <CombinedPreviewModal preview={preview} close={() => setPreviewOpen(false)} />}
+    </article>
   );
 }
 
@@ -993,7 +1249,7 @@ function PracticeDialog({ tree, close, updateTree }) {
           <div className="practice-question" key={node.id}>
             <small>{node.level === 0 ? "Root question" : `Follow-up ${node.level}`}</small>
             <h3>{node.question}</h3>
-            <FormattedTextarea value={node.myAnswer} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: value } : entry) }))} placeholder="Practice your answer here…" ariaLabel={`Answer for ${node.question}`} />
+            <RichTextEditor value={node.myAnswer} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: value } : entry) }))} placeholder="Practice your answer here…" ariaLabel={`Answer for ${node.question}`} />
           </div>
         ))}
         <div className="dialog-actions">
@@ -1037,7 +1293,7 @@ function QuickReview({ data, modules, updateItem, updateTree, saveNow, onNavigat
               <article className="review-item" key={item.id}>
                 <small>{TYPE_LABELS[item.type] || item.type}</small><h3>{item.title}</h3>
                 <ItemMarkdownContent item={item} />
-                <FormattedTextarea className="quick-review-notes no-print" label="Notes / prepared answer" value={item.content.quickReviewNotes || ""} onChange={(value) => updateItem(item.id, { content: { ...item.content, quickReviewNotes: value } })} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
+                <RichTextEditor className="quick-review-notes no-print" label="Notes / prepared answer" value={item.content.quickReviewNotes || ""} onChange={(value) => updateItem(item.id, { content: { ...item.content, quickReviewNotes: value } })} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
                 <div className="quick-review-print-notes print-only"><b>Notes / prepared answer</b><MarkdownContent value={item.content.quickReviewNotes || ""} /></div>
                 <button className="quick-review-save no-print" onClick={() => saveNow()}>Save notes</button>
               </article>
@@ -1045,7 +1301,7 @@ function QuickReview({ data, modules, updateItem, updateTree, saveNow, onNavigat
             {trees.map((tree) => (
               <article className="review-item" key={tree.id}>
                 <small>Drill tree</small><h3>{tree.title}</h3><ol>{tree.nodes.map((node) => <li key={node.id}><b>{node.question}</b>{node.myAnswer && <MarkdownContent value={node.myAnswer} />}</li>)}</ol>
-                <FormattedTextarea className="quick-review-notes no-print" label="Notes / prepared answer" value={tree.quickReviewNotes || ""} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, quickReviewNotes: value }))} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
+                <RichTextEditor className="quick-review-notes no-print" label="Notes / prepared answer" value={tree.quickReviewNotes || ""} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, quickReviewNotes: value }))} placeholder="Capture additional quick-review notes, reminders, or talking points…" />
                 <div className="quick-review-print-notes print-only"><b>Notes / prepared answer</b><MarkdownContent value={tree.quickReviewNotes || ""} /></div>
                 <button className="quick-review-save no-print" onClick={() => saveNow()}>Save notes</button>
               </article>
@@ -1059,15 +1315,54 @@ function QuickReview({ data, modules, updateItem, updateTree, saveNow, onNavigat
 
 const CUSTOM_MODULE_COLORS = ["#4f7b68", "#7b6455", "#65759a", "#8a647d", "#5c7b80", "#85733f"];
 
+function CollapsibleCard({ title, summary, expanded, onExpandedChange, className = "", children }) {
+  const contentId = useId();
+  const toggle = () => onExpandedChange(!expanded);
+  const handleKeyDown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    toggle();
+  };
+  return (
+    <section className={`settings-panel panel collapsible-card ${expanded ? "expanded" : "collapsed"} ${className}`}>
+      <div className="collapsible-card-header" role="button" tabIndex={0} aria-expanded={expanded} aria-controls={contentId} onClick={toggle} onKeyDown={handleKeyDown}>
+        <div className="collapsible-card-heading"><h2>{title}</h2>{!expanded && summary && <p>{summary}</p>}</div>
+        <span className="collapsible-card-chevron" aria-hidden="true">⌄</span>
+      </div>
+      <div id={contentId} className="collapsible-card-body" aria-hidden={!expanded}>
+        <div className="collapsible-card-content">{children}</div>
+      </div>
+    </section>
+  );
+}
+
 function Settings({ data, setData, exportData, importData, resetData, deletePreparationSection, reorderPreparationSections, selectWorkspace, addWorkspace, saveWorkspaceDetails, addRound, saveRound, removeRound }) {
   const activeWorkspace = data.workspaces.find((workspace) => workspace.id === data.activeWorkspaceId) || data.workspaces[0];
   const [opportunityDraft, setOpportunityDraft] = useState(() => ({ companyName: activeWorkspace?.companyName || "", roleTitle: activeWorkspace?.roleTitle || "" }));
   const [roundDrafts, setRoundDrafts] = useState(() => data.rounds || []);
   const [sectionDrafts, setSectionDrafts] = useState(() => data.settings.preparationModules || []);
+  const [expandedCards, setExpandedCards] = useState({ opportunity: true, rounds: false, preparation: false, localData: false });
   useEffect(() => {
     setOpportunityDraft({ companyName: activeWorkspace?.companyName || "", roleTitle: activeWorkspace?.roleTitle || "" });
   }, [activeWorkspace?.id, activeWorkspace?.companyName, activeWorkspace?.roleTitle]);
   useEffect(() => setRoundDrafts(data.rounds || []), [data.rounds]);
+  const setCardExpanded = (card, expanded) => setExpandedCards((current) => ({ ...current, [card]: expanded }));
+  const expandedCount = Object.values(expandedCards).filter(Boolean).length;
+  const expandAll = expandedCount <= 2;
+  const toggleAllCards = () => setExpandedCards({ opportunity: expandAll, rounds: expandAll, preparation: expandAll, localData: expandAll });
+  const nextRoundDraft = [...roundDrafts]
+    .filter((round) => round.status === "upcoming")
+    .sort((a, b) => {
+      const aTime = new Date(a.scheduledDate).getTime();
+      const bTime = new Date(b.scheduledDate).getTime();
+      return (Number.isNaN(aTime) ? Number.POSITIVE_INFINITY : aTime) - (Number.isNaN(bTime) ? Number.POSITIVE_INFINITY : bTime) || a.sequenceOrder - b.sequenceOrder;
+    })[0];
+  const roundsSummary = roundDrafts.length === 0
+    ? "No rounds added yet"
+    : `${roundDrafts.length} round${roundDrafts.length === 1 ? "" : "s"}${nextRoundDraft ? ` · next: ${nextRoundDraft.label || "Untitled round"} on ${nextRoundDraft.scheduledDate ? formatDate(nextRoundDraft.scheduledDate) : "date not set"}` : " · no upcoming round"}`;
+  const builtinIds = new Set(MODULES.map((module) => module.id));
+  const builtinCount = sectionDrafts.filter((section) => builtinIds.has(section.id)).length;
+  const customCount = sectionDrafts.length - builtinCount;
   const updateRoundDraft = (id, patch) => setRoundDrafts((current) => current.map((round) => round.id === id ? { ...round, ...patch } : round));
   const addRoundDraft = () => setRoundDrafts((current) => [...current, {
     id: `new-${createId()}`,
@@ -1139,8 +1434,9 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
   return (
     <main className="page settings-page">
       <section className="simple-header"><p className="eyebrow">Workspace setup</p><h1>Settings & backup</h1><p>Keep interview details current and protect your local preparation data.</p></section>
-      <section className="settings-panel panel opportunity-settings">
-        <div className="settings-section-heading"><h2>Opportunity details</h2><p>Each workspace represents one company and role.</p></div>
+      <div className="settings-card-controls"><button type="button" onClick={toggleAllCards}>{expandAll ? "Expand all" : "Collapse all"}</button></div>
+      <CollapsibleCard title="Opportunity Details" summary={`${activeWorkspace?.companyName || "Untitled company"} — ${activeWorkspace?.roleTitle || "Role not set"}`} expanded={expandedCards.opportunity} onExpandedChange={(expanded) => setCardExpanded("opportunity", expanded)} className="opportunity-settings">
+        <p className="settings-card-intro">Each workspace represents one company and role.</p>
         <div className="opportunity-picker">
           <label>Current opportunity
             <select value={data.activeWorkspaceId || ""} onChange={(event) => selectWorkspace(Number(event.target.value))}>
@@ -1154,9 +1450,9 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
           <label>Role title<input value={opportunityDraft.roleTitle} onChange={(event) => setOpportunityDraft((current) => ({ ...current, roleTitle: event.target.value }))} placeholder="Product Manager, Data Platform" /></label>
         </div>
         <button type="button" className="primary-button" onClick={() => saveWorkspaceDetails(opportunityDraft)}>Save opportunity</button>
-      </section>
-      <section className="settings-panel panel rounds-settings">
-        <div className="settings-section-heading"><h2>Interview rounds</h2><p>Plan and track every stage for this opportunity.</p></div>
+      </CollapsibleCard>
+      <CollapsibleCard title="Interview Rounds" summary={roundsSummary} expanded={expandedCards.rounds} onExpandedChange={(expanded) => setCardExpanded("rounds", expanded)} className="rounds-settings">
+        <p className="settings-card-intro">Plan and track every stage for this opportunity.</p>
         <div className="round-draft-list">
           {roundDrafts.length === 0 && <p className="muted">No interview rounds yet. Add the first round below.</p>}
           {roundDrafts.map((round) => (
@@ -1173,20 +1469,18 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
                 <label className="round-interviewers">Interviewers<input value={(round.interviewers || []).map((person) => typeof person === "string" ? person : person.name).filter(Boolean).join(", ")} onChange={(event) => updateRoundDraft(round.id, { interviewers: event.target.value.split(",").map((name, index) => ({ id: round.interviewers?.[index]?.id || createId(), name: name.trim() })).filter((person) => person.name) })} placeholder="Alex Rivera, Morgan Lee" /></label>
               </div>
               <div className="round-notes-grid">
-                <FormattedTextarea label="Interviewer research" value={round.interviewerNotes || ""} onChange={(value) => updateRoundDraft(round.id, { interviewerNotes: value })} />
-                <FormattedTextarea label="Questions to ask" value={round.questionsToAsk || ""} onChange={(value) => updateRoundDraft(round.id, { questionsToAsk: value })} />
-                <FormattedTextarea label="Outcome notes" value={round.outcomeNotes || ""} onChange={(value) => updateRoundDraft(round.id, { outcomeNotes: value })} />
+                <RichTextEditor label="Interviewer research" value={round.interviewerNotes || ""} onChange={(value) => updateRoundDraft(round.id, { interviewerNotes: value })} />
+                <RichTextEditor label="Questions to ask" value={round.questionsToAsk || ""} onChange={(value) => updateRoundDraft(round.id, { questionsToAsk: value })} />
+                <RichTextEditor label="Outcome notes" value={round.outcomeNotes || ""} onChange={(value) => updateRoundDraft(round.id, { outcomeNotes: value })} />
               </div>
               <div className="round-draft-actions"><button type="button" className="save-link" onClick={() => saveRoundDraft(round)}>Save</button><button type="button" className="danger-link" onClick={() => deleteRoundDraft(round)}>Delete</button></div>
             </article>
           ))}
         </div>
         <button type="button" className="add-preparation-button" onClick={addRoundDraft}><span>＋</span>Add interview round</button>
-      </section>
-      <section className="settings-panel panel preparation-settings">
-        <div className="settings-section-heading">
-          <div><h2>Add new preparation</h2><p>Create, edit, and reorder every preparation section shown in the sidebar and preparation map.</p></div>
-        </div>
+      </CollapsibleCard>
+      <CollapsibleCard title="Preparation Sections" summary={`${sectionDrafts.length} sections (${builtinCount} built-in, ${customCount} custom)`} expanded={expandedCards.preparation} onExpandedChange={(expanded) => setCardExpanded("preparation", expanded)} className="preparation-settings">
+        <p className="settings-card-intro">Create, edit, and reorder every preparation section shown in the sidebar and preparation map.</p>
         <div className="preparation-draft-list">
           {sectionDrafts.length === 0 && <p className="muted">No custom preparation sections yet. Use the plus button to add one.</p>}
           {sectionDrafts.map((draft) => {
@@ -1212,12 +1506,12 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
           })}
         </div>
         <button className="add-preparation-button" onClick={addSectionDraft}><span>＋</span>Add another preparation section</button>
-      </section>
-      <section className="settings-panel panel">
-        <h2>Local data</h2><p>This dashboard stores data in a local SQLite database on this laptop. Export a backup regularly.</p>
+      </CollapsibleCard>
+      <CollapsibleCard title="Local Data & Backup" summary="Export, import, or reset this workspace's data" expanded={expandedCards.localData} onExpandedChange={(expanded) => setCardExpanded("localData", expanded)}>
+        <p>This dashboard stores data in a local SQLite database on this laptop. Export a backup regularly.</p>
         <div className="button-row"><button className="primary-button" onClick={exportData}>Export JSON backup</button><button className="secondary-button" onClick={importData}>Import JSON backup</button><button className="danger-button" onClick={resetData}>Reset dashboard</button></div>
         <small>Schema version {SCHEMA_VERSION} · {data.items.length} items · {data.drillTrees.length} drill tree{data.drillTrees.length === 1 ? "" : "s"}</small>
-      </section>
+      </CollapsibleCard>
     </main>
   );
 }

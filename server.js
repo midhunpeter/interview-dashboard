@@ -3,6 +3,7 @@ import cors from "cors";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { db, databasePath } from "./db.js";
+import { CASE_FRAMEWORK_STAGES } from "./caseFramework.js";
 
 const app = express();
 const port = Number(process.env.PORT || 5173);
@@ -22,6 +23,7 @@ const jsonColumns = {
   translation_map: new Set(),
   knowledge_items: new Set(["tags"]),
   interview_rounds: new Set(["interviewers"]),
+  case_framework_bank: new Set(["tags", "used_for"]),
 };
 
 function parseJson(value) {
@@ -88,48 +90,110 @@ function sendNotFound(res, label = "Record") {
   return res.status(404).json({ error: `${label} not found` });
 }
 
-function registerCrudRoute(route, table, columns) {
-  app.get(`/api/${route}`, (_req, res) => {
-    const rows = db.prepare(`SELECT * FROM ${table} ORDER BY id`).all();
-    res.json(rows.map((row) => withMetadata(table, route, row)));
+function itemRoundIds(itemType, itemId) {
+  return db.prepare("SELECT round_id FROM item_round_tags WHERE item_type = ? AND item_id = ? ORDER BY round_id")
+    .all(itemType, itemId)
+    .map((row) => row.round_id);
+}
+
+function withItemRoundTags(table, route, itemType, row) {
+  return { ...withMetadata(table, route, row), roundIds: itemRoundIds(itemType, row.id) };
+}
+
+function syncItemRoundTags(itemType, itemId, roundIds) {
+  const normalized = [...new Set(Array.isArray(roundIds) ? roundIds.filter((id) => Number.isInteger(id) && id > 0) : [])];
+  db.prepare("DELETE FROM item_round_tags WHERE item_type = ? AND item_id = ?").run(itemType, itemId);
+  const insert = db.prepare("INSERT INTO item_round_tags (item_type, item_id, round_id) VALUES (?, ?, ?)");
+  for (const roundId of normalized) insert.run(itemType, itemId, roundId);
+}
+
+function registerCrudRoute(route, table, columns, itemType, { workspaceScoped = false } = {}) {
+  app.get(`/api/${route}`, (req, res) => {
+    const requestedRoundId = Number(req.query.round_id);
+    const hasRoundFilter = Number.isInteger(requestedRoundId) && requestedRoundId > 0;
+    const requestedWorkspaceId = Number(req.query.workspace_id);
+    if (workspaceScoped && (!Number.isInteger(requestedWorkspaceId) || requestedWorkspaceId <= 0)) {
+      return res.status(400).json({ error: "A valid workspace_id is required" });
+    }
+    const filters = [];
+    const params = [];
+    if (workspaceScoped) {
+      filters.push("item.workspace_id = ?");
+      params.push(requestedWorkspaceId);
+    }
+    if (hasRoundFilter) {
+      filters.push(`(NOT EXISTS (
+            SELECT 1 FROM item_round_tags tags WHERE tags.item_type = ? AND tags.item_id = item.id
+          ) OR EXISTS (
+            SELECT 1 FROM item_round_tags tags WHERE tags.item_type = ? AND tags.item_id = item.id AND tags.round_id = ?
+          ))`);
+      params.push(itemType, itemType, requestedRoundId);
+    }
+    const rows = db.prepare(`SELECT item.* FROM ${table} item${filters.length ? ` WHERE ${filters.join(" AND ")}` : ""} ORDER BY item.id`).all(...params);
+    res.json(rows.map((row) => withItemRoundTags(table, route, itemType, row)));
   });
 
   app.get(`/api/${route}/:id`, (req, res) => {
     const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(req.params.id);
     if (!row) return sendNotFound(res);
-    return res.json(withMetadata(table, route, row));
+    return res.json(withItemRoundTags(table, route, itemType, row));
   });
 
   app.post(`/api/${route}`, (req, res) => {
-    const values = sanitizeBody(table, columns, req.body || {});
-    const keys = Object.keys(values);
-    const result = keys.length
-      ? db.prepare(`INSERT INTO ${table} (${keys.join(", ")}) VALUES (${keys.map(() => "?").join(", ")})`).run(...keys.map((key) => values[key]))
-      : db.prepare(`INSERT INTO ${table} DEFAULT VALUES`).run();
-    writeMetadata(route, Number(result.lastInsertRowid), req.body?._ui);
-    const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(result.lastInsertRowid);
-    res.status(201).json(withMetadata(table, route, row));
+    if (workspaceScoped) {
+      const workspaceId = Number(req.body?.workspace_id);
+      if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
+        return res.status(400).json({ error: "A valid workspace_id is required" });
+      }
+    }
+    const itemId = db.transaction(() => {
+      const values = sanitizeBody(table, columns, req.body || {});
+      const keys = Object.keys(values);
+      const result = keys.length
+        ? db.prepare(`INSERT INTO ${table} (${keys.join(", ")}) VALUES (${keys.map(() => "?").join(", ")})`).run(...keys.map((key) => values[key]))
+        : db.prepare(`INSERT INTO ${table} DEFAULT VALUES`).run();
+      const id = Number(result.lastInsertRowid);
+      writeMetadata(route, id, req.body?._ui);
+      syncItemRoundTags(itemType, id, req.body?.roundIds);
+      return id;
+    })();
+    const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(itemId);
+    res.status(201).json(withItemRoundTags(table, route, itemType, row));
   });
 
   app.put(`/api/${route}/:id`, (req, res) => {
     const existing = db.prepare(`SELECT id FROM ${table} WHERE id = ?`).get(req.params.id);
     if (!existing) return sendNotFound(res);
-    const values = sanitizeBody(table, columns, req.body || {});
-    const keys = Object.keys(values);
-    if (keys.length) {
-      db.prepare(`UPDATE ${table} SET ${keys.map((key) => `${key} = ?`).join(", ")} WHERE id = ?`)
-        .run(...keys.map((key) => values[key]), req.params.id);
+    if (workspaceScoped && Object.prototype.hasOwnProperty.call(req.body || {}, "workspace_id")) {
+      const workspaceId = Number(req.body.workspace_id);
+      if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
+        return res.status(400).json({ error: "A valid workspace_id is required" });
+      }
     }
-    writeMetadata(route, Number(req.params.id), req.body?._ui);
+    db.transaction(() => {
+      const values = sanitizeBody(table, columns, req.body || {});
+      const keys = Object.keys(values);
+      if (keys.length) {
+        db.prepare(`UPDATE ${table} SET ${keys.map((key) => `${key} = ?`).join(", ")} WHERE id = ?`)
+          .run(...keys.map((key) => values[key]), req.params.id);
+      }
+      writeMetadata(route, Number(req.params.id), req.body?._ui);
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "roundIds")) syncItemRoundTags(itemType, Number(req.params.id), req.body.roundIds);
+    })();
     const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(req.params.id);
-    return res.json(withMetadata(table, route, row));
+    return res.json(withItemRoundTags(table, route, itemType, row));
   });
 
   app.delete(`/api/${route}/:id`, (req, res) => {
-    const result = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(req.params.id);
+    const result = db.transaction(() => {
+      const deletion = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(req.params.id);
+      if (!deletion.changes) return deletion;
+      db.prepare("DELETE FROM item_round_tags WHERE item_type = ? AND item_id = ?").run(itemType, req.params.id);
+      deleteMetadata(route, Number(req.params.id));
+      deleteImages(route, Number(req.params.id));
+      return deletion;
+    })();
     if (!result.changes) return sendNotFound(res);
-    deleteMetadata(route, Number(req.params.id));
-    deleteImages(route, Number(req.params.id));
     return res.status(204).end();
   });
 }
@@ -185,7 +249,16 @@ app.put("/api/workspaces/:id", (req, res) => {
 });
 
 app.delete("/api/workspaces/:id", (req, res) => {
-  const result = db.prepare("DELETE FROM workspaces WHERE id = ?").run(req.params.id);
+  const result = db.transaction(() => {
+    const caseIds = db.prepare("SELECT id FROM case_framework_bank WHERE workspace_id = ?").all(req.params.id).map((row) => row.id);
+    const deleteCaseTags = db.prepare("DELETE FROM item_round_tags WHERE item_type = 'case_framework' AND item_id = ?");
+    for (const caseId of caseIds) {
+      deleteCaseTags.run(caseId);
+      deleteMetadata("case-framework", caseId);
+      deleteImages("case-framework", caseId);
+    }
+    return db.prepare("DELETE FROM workspaces WHERE id = ?").run(req.params.id);
+  })();
   if (!result.changes) return sendNotFound(res, "Workspace");
   return res.status(204).end();
 });
@@ -242,11 +315,47 @@ app.delete("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
   return res.status(204).end();
 });
 
-registerCrudRoute("story-bank", "story_bank", ["module", "title", "tags", "situation", "task", "action", "result", "used_for", "status"]);
-registerCrudRoute("question-bank", "question_bank", ["module", "sub_topic", "question", "my_answer", "status"]);
-registerCrudRoute("reliability-incidents", "reliability_incidents", ["title", "what_broke", "how_found", "how_fixed", "what_changed_after", "tags"]);
-registerCrudRoute("translation-map", "translation_map", ["scheduling_machine_pattern", "tempus_problem", "what_i_bring"]);
-registerCrudRoute("knowledge-items", "knowledge_items", ["module", "term", "definition", "notes", "tags"]);
+registerCrudRoute("story-bank", "story_bank", ["module", "title", "tags", "situation", "task", "action", "result", "used_for", "status"], "story");
+registerCrudRoute("case-framework", "case_framework_bank", ["workspace_id", "module", "title", "tags", ...CASE_FRAMEWORK_STAGES.map((stage) => stage.key), "used_for", "status"], "case_framework", { workspaceScoped: true });
+registerCrudRoute("question-bank", "question_bank", ["module", "sub_topic", "question", "my_answer", "status"], "question");
+registerCrudRoute("reliability-incidents", "reliability_incidents", ["title", "what_broke", "how_found", "how_fixed", "what_changed_after", "tags"], "reliability_incident");
+registerCrudRoute("translation-map", "translation_map", ["scheduling_machine_pattern", "tempus_problem", "what_i_bring"], "translation_map");
+registerCrudRoute("knowledge-items", "knowledge_items", ["module", "term", "definition", "notes", "tags"], "knowledge_item");
+
+function prepItemRows(table, itemType, roundId, workspaceId = null) {
+  const filters = [];
+  const params = [];
+  if (workspaceId != null) {
+    filters.push("item.workspace_id = ?");
+    params.push(workspaceId);
+  }
+  if (roundId != null) {
+    filters.push(`(NOT EXISTS (
+      SELECT 1 FROM item_round_tags tags WHERE tags.item_type = ? AND tags.item_id = item.id
+    ) OR EXISTS (
+      SELECT 1 FROM item_round_tags tags WHERE tags.item_type = ? AND tags.item_id = item.id AND tags.round_id = ?
+    ))`);
+    params.push(itemType, itemType, roundId);
+  }
+  return db.prepare(`SELECT item.* FROM ${table} item${filters.length ? ` WHERE ${filters.join(" AND ")}` : ""} ORDER BY item.id`).all(...params);
+}
+
+app.get("/api/prep-items", (req, res) => {
+  const workspaceId = Number(req.query.workspace_id);
+  if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
+    return res.status(400).json({ error: "A valid workspace_id is required" });
+  }
+  const roundValue = Number(req.query.round_id);
+  const roundId = Number.isInteger(roundValue) && roundValue > 0 ? roundValue : null;
+  const type = String(req.query.type || "");
+  if (type && !["story", "case_framework"].includes(type)) return res.status(400).json({ error: "type must be story or case_framework" });
+
+  const stories = type === "case_framework" ? [] : prepItemRows("story_bank", "story", roundId)
+    .map((row) => ({ ...withItemRoundTags("story_bank", "story-bank", "story", row), itemType: "story" }));
+  const cases = type === "story" ? [] : prepItemRows("case_framework_bank", "case_framework", roundId, workspaceId)
+    .map((row) => ({ ...withItemRoundTags("case_framework_bank", "case-framework", "case_framework", row), itemType: "case_framework" }));
+  return res.json([...stories, ...cases]);
+});
 
 const schedulingColumns = ["overview", "architecture_notes", "ownership_stories", "scale_metrics", "lessons_learned"];
 app.get("/api/scheduling-machine", (_req, res) => {
@@ -361,6 +470,7 @@ const supportedImageTypes = new Map([
 ]);
 const imageOwnerTables = new Map([
   ["story-bank", "story_bank"],
+  ["case-framework", "case_framework_bank"],
   ["question-bank", "question_bank"],
   ["scheduling-machine", "scheduling_machine"],
   ["reliability-incidents", "reliability_incidents"],
@@ -436,6 +546,10 @@ app.get("/api/search", (req, res) => {
       substr(trim(coalesce(title, '') || ' ' || coalesce(situation, '') || ' ' || coalesce(task, '') || ' ' || coalesce(action, '') || ' ' || coalesce(result, '')), 1, 180)
     FROM story_bank WHERE module LIKE ? OR title LIKE ? OR tags LIKE ? OR situation LIKE ? OR task LIKE ? OR action LIKE ? OR result LIKE ? OR used_for LIKE ?
     UNION ALL
+    SELECT module, id, 'case_framework' AS kind, title,
+      substr(trim(coalesce(title, '') || ' ' || coalesce(clarify, '') || ' ' || coalesce(user_goal, '') || ' ' || coalesce(pain_points, '') || ' ' || coalesce(solutions, '') || ' ' || coalesce(prioritize, '') || ' ' || coalesce(success, '') || ' ' || coalesce(risks_wrap, '')), 1, 180)
+    FROM case_framework_bank WHERE module LIKE ? OR title LIKE ? OR tags LIKE ? OR clarify LIKE ? OR user_goal LIKE ? OR pain_points LIKE ? OR solutions LIKE ? OR prioritize LIKE ? OR success LIKE ? OR risks_wrap LIKE ? OR used_for LIKE ?
+    UNION ALL
     SELECT module, id, 'question' AS kind, question AS title,
       substr(trim(coalesce(question, '') || ' ' || coalesce(my_answer, '')), 1, 180)
     FROM question_bank WHERE module LIKE ? OR sub_topic LIKE ? OR question LIKE ? OR my_answer LIKE ?
@@ -465,7 +579,7 @@ app.get("/api/search", (req, res) => {
       substr(trim(coalesce(term, '') || ' ' || coalesce(definition, '') || ' ' || coalesce(notes, '')), 1, 180)
     FROM knowledge_items WHERE module LIKE ? OR term LIKE ? OR definition LIKE ? OR notes LIKE ? OR tags LIKE ?
     LIMIT 100
-  `).all(...Array(39).fill(pattern));
+  `).all(...Array(50).fill(pattern));
   return res.json(rows);
 });
 

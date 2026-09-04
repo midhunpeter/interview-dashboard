@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { CASE_FRAMEWORK_STAGES } from "./caseFramework.js";
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 const dataDirectory = path.join(projectRoot, "data");
@@ -45,6 +46,17 @@ db.exec(`
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS item_round_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    round_id INTEGER NOT NULL REFERENCES interview_rounds(id) ON DELETE CASCADE,
+    UNIQUE(item_type, item_id, round_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_item_round_tags_lookup ON item_round_tags(item_type, item_id);
+  CREATE INDEX IF NOT EXISTS idx_item_round_tags_round ON item_round_tags(round_id);
+
   CREATE TABLE IF NOT EXISTS story_bank (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     module TEXT,
@@ -56,6 +68,24 @@ db.exec(`
     result TEXT,
     used_for TEXT,
     status TEXT DEFAULT 'not-started'
+  );
+
+  CREATE TABLE IF NOT EXISTS case_framework_bank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+    module TEXT,
+    title TEXT,
+    tags TEXT,
+    clarify TEXT,
+    user_goal TEXT,
+    pain_points TEXT,
+    solutions TEXT,
+    prioritize TEXT,
+    success TEXT,
+    risks_wrap TEXT,
+    used_for TEXT,
+    status TEXT DEFAULT 'not-started',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS question_bank (
@@ -148,6 +178,37 @@ db.prepare(`
 `).run();
 
 const tableColumns = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+
+const legacyCaseFrameworkStages = ["understand", "define", "solve", "prove"];
+db.transaction(() => {
+  let columns = tableColumns("case_framework_bank");
+  for (const { key } of CASE_FRAMEWORK_STAGES) {
+    if (!columns.has(key)) db.exec(`ALTER TABLE case_framework_bank ADD COLUMN ${key} TEXT`);
+  }
+  columns = tableColumns("case_framework_bank");
+  for (const key of legacyCaseFrameworkStages) {
+    if (columns.has(key)) db.exec(`ALTER TABLE case_framework_bank DROP COLUMN ${key}`);
+  }
+
+  const metadataRows = db.prepare("SELECT record_id, value FROM app_metadata WHERE resource = 'case-framework'").all();
+  const updateMetadata = db.prepare("UPDATE app_metadata SET value = ? WHERE resource = 'case-framework' AND record_id = ?");
+  for (const row of metadataRows) {
+    try {
+      const metadata = JSON.parse(row.value);
+      if (!metadata?.content || typeof metadata.content !== "object") continue;
+      let changed = false;
+      for (const key of legacyCaseFrameworkStages) {
+        if (Object.prototype.hasOwnProperty.call(metadata.content, key)) {
+          delete metadata.content[key];
+          changed = true;
+        }
+      }
+      if (changed) updateMetadata.run(JSON.stringify(metadata), row.record_id);
+    } catch {
+      // Leave unrelated or malformed metadata untouched.
+    }
+  }
+})();
 
 if (!tableColumns("drill_trees").has("round_id")) {
   db.exec("ALTER TABLE drill_trees ADD COLUMN round_id INTEGER REFERENCES interview_rounds(id) ON DELETE SET NULL");

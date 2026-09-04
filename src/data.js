@@ -1,3 +1,5 @@
+import { CASE_FRAMEWORK_STAGES } from "../caseFramework.js";
+
 export const SCHEMA_VERSION = 1;
 
 export const MODULES = [
@@ -33,6 +35,7 @@ const seedItem = (module, title, type = "note", priority = "medium", starred = f
   sortOrder: 0,
   createdAt: now(),
   updatedAt: now(),
+  roundIds: [],
   content: { notes: "", ...content },
 });
 
@@ -128,6 +131,7 @@ const baseItem = (resource, row, fields) => {
     ...ui,
     content: { ...(ui.content || {}), ...(fields.content || { notes: "" }) },
     id: `${resource}:${row.id}`,
+    roundIds: Array.isArray(row.roundIds) ? row.roundIds : [],
   };
 };
 
@@ -136,13 +140,15 @@ function rememberItem(item, resource, dbId) {
   return item;
 }
 
-function rowsToItems({ stories, questions, scheduling, incidents, translations, knowledge, images }) {
+function rowsToItems({ stories, caseFrameworks = [], questions, scheduling, incidents, translations, knowledge, images }) {
   const items = [
     ...stories.map((row) => rememberItem(baseItem("story-bank", row, {
       type: "story",
+      itemType: "story",
       module: row.module || "positioning",
       title: row.title || "Untitled story",
       tags: row.tags || [],
+      usedFor: row.used_for || [],
       status: row.status || "not-started",
       content: {
         situation: row.situation || "",
@@ -151,6 +157,18 @@ function rowsToItems({ stories, questions, scheduling, incidents, translations, 
         result: row.result || "",
       },
     }), "story-bank", row.id)),
+    ...caseFrameworks.map((row) => rememberItem(baseItem("case-framework", row, {
+      type: "case-framework",
+      itemType: "case_framework",
+      workspaceId: row.workspace_id,
+      module: row.module || "positioning",
+      title: row.title || "Untitled case framework",
+      tags: row.tags || [],
+      usedFor: row.used_for || [],
+      status: row.status || "not-started",
+      createdAt: row.created_at || timestamp(),
+      content: Object.fromEntries(CASE_FRAMEWORK_STAGES.map(({ key }) => [key, row[key] || ""])),
+    }), "case-framework", row.id)),
     ...questions.map((row) => rememberItem(baseItem("question-bank", row, {
       type: "question",
       module: row.module || "positioning",
@@ -263,17 +281,9 @@ async function loadDatabaseData() {
   itemIdentities.clear();
   treeIdentities.clear();
   followupIdentities.clear();
-  const [settings, workspacesResponse, stories, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
+  const [settings, workspacesResponse] = await Promise.all([
     api("/settings"),
     api("/workspaces"),
-    api("/story-bank"),
-    api("/question-bank"),
-    api("/drill-trees"),
-    api("/scheduling-machine"),
-    api("/reliability-incidents"),
-    api("/translation-map"),
-    api("/knowledge-items"),
-    api("/item-images"),
   ]);
   const workspaces = workspacesResponse.map((workspace) => ({
     id: workspace.id,
@@ -283,7 +293,19 @@ async function loadDatabaseData() {
   }));
   const requestedWorkspaceId = Number(settings._ui?.activeWorkspaceId);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === requestedWorkspaceId) || workspaces[0] || null;
-  const roundsResponse = activeWorkspace ? await api(`/workspaces/${activeWorkspace.id}/rounds`) : [];
+  const [prepItems, roundsResponse, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
+    activeWorkspace ? api(`/prep-items?workspace_id=${activeWorkspace.id}`) : Promise.resolve([]),
+    activeWorkspace ? api(`/workspaces/${activeWorkspace.id}/rounds`) : Promise.resolve([]),
+    api("/question-bank"),
+    api("/drill-trees"),
+    api("/scheduling-machine"),
+    api("/reliability-incidents"),
+    api("/translation-map"),
+    api("/knowledge-items"),
+    api("/item-images"),
+  ]);
+  const stories = prepItems.filter((item) => item.itemType === "story");
+  const caseFrameworks = prepItems.filter((item) => item.itemType === "case_framework");
   const rounds = roundsResponse.map(roundFromApi);
   const data = {
     schemaVersion: SCHEMA_VERSION,
@@ -301,7 +323,7 @@ async function loadDatabaseData() {
         ...(settings._ui?.customModules || []),
       ],
     },
-    items: rowsToItems({ stories, questions, scheduling, incidents, translations, knowledge, images }),
+    items: rowsToItems({ stories, caseFrameworks, questions, scheduling, incidents, translations, knowledge, images }),
     drillTrees: trees.map(rowToTree),
   };
 
@@ -313,7 +335,7 @@ async function loadDatabaseData() {
     scheduling.lessons_learned,
   ].some((value) => typeof value === "string" && value.trim());
   const hasStoredPreparation = stories.length || questions.length || trees.length || incidents.length
-    || translations.length || knowledge.length || schedulingHasContent;
+    || caseFrameworks.length || translations.length || knowledge.length || schedulingHasContent;
   if (!hasStoredPreparation) {
     const initial = createInitialData();
     await saveData(initial);
@@ -327,9 +349,34 @@ export function loadData() {
   return initialLoadPromise;
 }
 
+export async function loadRoundFilteredContent(roundId = null, workspaceId = null) {
+  itemIdentities.clear();
+  treeIdentities.clear();
+  followupIdentities.clear();
+  const roundQuery = Number.isInteger(roundId) && roundId > 0 ? `&round_id=${roundId}` : "";
+  const query = Number.isInteger(roundId) && roundId > 0 ? `?round_id=${roundId}` : "";
+  const [prepItems, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
+    api(`/prep-items?workspace_id=${workspaceId}${roundQuery}`),
+    api(`/question-bank${query}`),
+    api(`/drill-trees${query}`),
+    api("/scheduling-machine"),
+    api(`/reliability-incidents${query}`),
+    api(`/translation-map${query}`),
+    api(`/knowledge-items${query}`),
+    api("/item-images"),
+  ]);
+  const stories = prepItems.filter((item) => item.itemType === "story");
+  const caseFrameworks = prepItems.filter((item) => item.itemType === "case_framework");
+  return {
+    items: rowsToItems({ stories, caseFrameworks, questions, scheduling, incidents, translations, knowledge, images }),
+    drillTrees: trees.map(rowToTree),
+  };
+}
+
 function resourceForItem(item) {
   if (item.module === "scheduling-machine" && item.title === "Platform overview and scale" && item.type === "note") return "scheduling-machine";
   if (item.type === "story") return "story-bank";
+  if (item.type === "case-framework") return "case-framework";
   if (item.type === "question" || item.type === "pitch" || item.type === "open-question") return "question-bank";
   if (item.type === "incident") return "reliability-incidents";
   if (item.type === "translation") return "translation-map";
@@ -359,11 +406,23 @@ function itemPayload(item, resource) {
     task: item.content?.task || "",
     action: item.content?.action ?? notes,
     result: item.content?.result || "",
-    used_for: [],
+    used_for: item.usedFor || [],
     status: item.status,
+    roundIds: item.roundIds || [],
     _ui,
   };
-  if (resource === "question-bank") return { module: item.module, sub_topic: item.title, question: item.title, my_answer: notes, status: item.status, _ui };
+  if (resource === "case-framework") return {
+    workspace_id: item.workspaceId,
+    module: item.module,
+    title: item.title,
+    tags: item.tags || [],
+    ...Object.fromEntries(CASE_FRAMEWORK_STAGES.map(({ key }) => [key, item.content?.[key] || ""])),
+    used_for: item.usedFor || [],
+    status: item.status,
+    roundIds: item.roundIds || [],
+    _ui,
+  };
+  if (resource === "question-bank") return { module: item.module, sub_topic: item.title, question: item.title, my_answer: notes, status: item.status, roundIds: item.roundIds || [], _ui };
   if (resource === "reliability-incidents") return {
     title: item.title,
     what_broke: item.content?.whatBroke ?? notes,
@@ -371,12 +430,14 @@ function itemPayload(item, resource) {
     how_fixed: item.content?.howFixed || "",
     what_changed_after: item.content?.whatChangedAfter || "",
     tags: item.tags || [],
+    roundIds: item.roundIds || [],
     _ui,
   };
   if (resource === "translation-map") return {
     scheduling_machine_pattern: item.content?.schedulingMachinePattern || "",
     tempus_problem: item.content?.tempusProblem || "",
     what_i_bring: item.content?.whatIBring || "",
+    roundIds: item.roundIds || [],
     _ui,
   };
   if (resource === "scheduling-machine") return {
@@ -393,6 +454,7 @@ function itemPayload(item, resource) {
     definition: item.content?.definition ?? notes,
     notes: item.content?.definition == null ? "" : notes,
     tags: item.tags || [],
+    roundIds: item.roundIds || [],
     _ui,
   };
 }

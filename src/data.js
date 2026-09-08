@@ -2,42 +2,14 @@ import { CASE_FRAMEWORK_STAGES } from "../caseFramework.js";
 
 export const SCHEMA_VERSION = 1;
 
-export const MODULES = [
-  { id: "positioning", label: "Positioning", short: "PO", color: "#9e6a50", description: "Build a crisp story for why your background fits this team." },
-  { id: "scheduling-machine", label: "Scheduling Machine", short: "SM", color: "#6c7f6b", description: "Show genuine technical ownership, decisions, scale, and lessons." },
-  { id: "pm-depth", label: "Technical PM Depth", short: "TP", color: "#5d7397", description: "Prepare for deep questions on APIs, data, rules, and integrations." },
-  { id: "platform-reliability", label: "Platform Reliability", short: "PR", color: "#8c6c87", description: "Practice operational maturity, integrity, and observability." },
-  { id: "internal-platform-pm", label: "Internal Platform PM", short: "IP", color: "#82714d", description: "Frame other teams as customers and prove adoption thinking." },
-  { id: "healthcare-interoperability", label: "Healthcare Interop", short: "HI", color: "#477a75", description: "Review standards, workflows, regulation, and domain examples." },
-  { id: "data-platform-translation", label: "Data Platform Translation", short: "DT", color: "#936251", description: "Map Scheduling Machine lessons to Tempus platform problems." },
-  { id: "hiring-manager-simulation", label: "HM Simulation", short: "HM", color: "#606a88", description: "Rehearse progressive technical drilling and follow-up pressure." },
-];
-
 export const STATUSES = [
   { value: "not-started", label: "Not started", weight: 0 },
   { value: "reviewed", label: "Reviewed", weight: 0.5 },
   { value: "confident", label: "Confident", weight: 1 },
 ];
 
-const now = () => new Date().toISOString();
 export const createId = () => globalThis.crypto?.randomUUID?.()
   || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-
-const seedItem = (module, title, type = "note", priority = "medium", starred = false, content = {}) => ({
-  id: createId(),
-  type,
-  module,
-  title,
-  tags: [],
-  status: "not-started",
-  priority,
-  starred,
-  sortOrder: 0,
-  createdAt: now(),
-  updatedAt: now(),
-  roundIds: [],
-  content: { notes: "", ...content },
-});
 
 export function createInitialData() {
   return {
@@ -51,44 +23,10 @@ export function createInitialData() {
       interviewDate: "",
       interviewStage: "Hiring manager interview",
       interviewers: [],
-      preparationModules: MODULES.map((module) => ({ ...module })),
+      preparationModules: [],
     },
-    items: [
-      seedItem("positioning", "30-second introduction", "pitch", "high", true),
-      seedItem("positioning", "Why Tempus and why this team?", "question", "high", true),
-      seedItem("scheduling-machine", "Platform overview and scale", "note", "high", true),
-      seedItem("scheduling-machine", "A decision I would make differently", "story", "medium"),
-      seedItem("pm-depth", "API contracts and versioning", "question", "high"),
-      seedItem("pm-depth", "Caching and invalidation trade-offs", "question", "medium"),
-      seedItem("platform-reliability", "Production incident case note", "incident", "high", true),
-      seedItem("internal-platform-pm", "Internal customer adoption story", "story", "high"),
-      seedItem("healthcare-interoperability", "FHIR, HL7 v2, and DICOM relationship", "knowledge", "high"),
-      seedItem("data-platform-translation", "Scheduling constraints → data platform rules", "translation", "high", true, {
-        schedulingMachinePattern: "",
-        tempusProblem: "",
-        whatIBring: "",
-      }),
-      seedItem("hiring-manager-simulation", "Questions to ask the hiring manager", "open-question", "high", true),
-    ],
-    drillTrees: [
-      {
-        id: createId(),
-        module: "hiring-manager-simulation",
-        roundId: null,
-        title: "Walk me through the Scheduling Machine",
-        tags: ["must-review"],
-        priority: "high",
-        starred: true,
-        sortOrder: 0,
-        createdAt: now(),
-        updatedAt: now(),
-        nodes: [
-          { id: createId(), parentId: null, level: 0, question: "What was the Scheduling Machine?", myAnswer: "", status: "not-started", sortOrder: 0 },
-          { id: createId(), parentId: null, level: 1, question: "How did the core scheduling logic work?", myAnswer: "", status: "not-started", sortOrder: 1 },
-          { id: createId(), parentId: null, level: 2, question: "Where did consistency or failure handling get difficult?", myAnswer: "", status: "not-started", sortOrder: 2 },
-        ],
-      },
-    ],
+    items: [],
+    drillTrees: [],
   };
 }
 
@@ -117,7 +55,7 @@ const baseItem = (resource, row, fields) => {
   return {
     id: `${resource}:${row.id}`,
     type: "note",
-    module: "positioning",
+    module: "",
     title: "Untitled prep item",
     tags: [],
     status: "not-started",
@@ -145,7 +83,7 @@ function rowsToItems({ stories, caseFrameworks = [], questions, scheduling, inci
     ...stories.map((row) => rememberItem(baseItem("story-bank", row, {
       type: "story",
       itemType: "story",
-      module: row.module || "positioning",
+      module: row.module || "",
       title: row.title || "Untitled story",
       tags: row.tags || [],
       usedFor: row.used_for || [],
@@ -161,7 +99,7 @@ function rowsToItems({ stories, caseFrameworks = [], questions, scheduling, inci
       type: "case-framework",
       itemType: "case_framework",
       workspaceId: row.workspace_id,
-      module: row.module || "positioning",
+      module: row.module || "",
       title: row.title || "Untitled case framework",
       tags: row.tags || [],
       usedFor: row.used_for || [],
@@ -171,7 +109,7 @@ function rowsToItems({ stories, caseFrameworks = [], questions, scheduling, inci
     }), "case-framework", row.id)),
     ...questions.map((row) => rememberItem(baseItem("question-bank", row, {
       type: "question",
-      module: row.module || "positioning",
+      module: row.module || "",
       title: row.question || "Untitled question",
       status: row.status || "not-started",
       content: { notes: row.my_answer || "" },
@@ -201,7 +139,7 @@ function rowsToItems({ stories, caseFrameworks = [], questions, scheduling, inci
     }), "translation-map", row.id)),
     ...knowledge.map((row) => rememberItem(baseItem("knowledge-items", row, {
       type: "knowledge",
-      module: row.module || "positioning",
+      module: row.module || "",
       title: row.term || "Untitled knowledge item",
       tags: row.tags || [],
       content: { definition: row.definition || "", notes: row.notes || "" },
@@ -263,7 +201,7 @@ function rowToTree(row) {
   treeIdentities.set(treeId, row.id);
   return {
     id: treeId,
-    module: row.module || "hiring-manager-simulation",
+    module: row.module || "",
     roundId: row.round_id ?? null,
     title: ui.title || row.root_question || "Untitled drill tree",
     tags: ui.tags || [],
@@ -293,7 +231,8 @@ async function loadDatabaseData() {
   }));
   const requestedWorkspaceId = Number(settings._ui?.activeWorkspaceId);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === requestedWorkspaceId) || workspaces[0] || null;
-  const [prepItems, roundsResponse, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
+  const [prepSectionsResponse, prepItems, roundsResponse, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
+    activeWorkspace ? api(`/prep-sections?workspace_id=${activeWorkspace.id}`) : Promise.resolve([]),
     activeWorkspace ? api(`/prep-items?workspace_id=${activeWorkspace.id}`) : Promise.resolve([]),
     activeWorkspace ? api(`/workspaces/${activeWorkspace.id}/rounds`) : Promise.resolve([]),
     api("/question-bank"),
@@ -318,29 +257,12 @@ async function loadDatabaseData() {
       interviewDate: "",
       interviewStage: "",
       interviewers: [],
-      preparationModules: settings._ui?.preparationModules || [
-        ...MODULES.map((module) => ({ ...module })),
-        ...(settings._ui?.customModules || []),
-      ],
+      preparationModules: prepSectionsResponse.map(prepSectionFromApi),
     },
     items: rowsToItems({ stories, caseFrameworks, questions, scheduling, incidents, translations, knowledge, images }),
     drillTrees: trees.map(rowToTree),
   };
 
-  const schedulingHasContent = [
-    scheduling.overview,
-    ...(scheduling.architecture_notes || []),
-    ...(scheduling.ownership_stories || []),
-    scheduling.scale_metrics,
-    scheduling.lessons_learned,
-  ].some((value) => typeof value === "string" && value.trim());
-  const hasStoredPreparation = stories.length || questions.length || trees.length || incidents.length
-    || caseFrameworks.length || translations.length || knowledge.length || schedulingHasContent;
-  if (!hasStoredPreparation) {
-    const initial = createInitialData();
-    await saveData(initial);
-    return initial;
-  }
   return data;
 }
 
@@ -551,9 +473,14 @@ async function persistData(data) {
   await api("/settings", { method: "PUT", body: {
     _ui: {
       activeWorkspaceId: data.activeWorkspaceId,
-      preparationModules: data.settings.preparationModules || MODULES,
     },
   } });
+  if (Number.isInteger(data.activeWorkspaceId) && data.activeWorkspaceId > 0) {
+    await api(`/prep-sections?workspace_id=${data.activeWorkspaceId}`, {
+      method: "PUT",
+      body: { sections: data.settings.preparationModules || [] },
+    });
+  }
   await persistItems(data.items || []);
   await persistTrees(data.drillTrees || []);
 }
@@ -579,6 +506,21 @@ function roundFromApi(round) {
     outcomeNotes: round.outcome_notes || "",
     createdAt: round.created_at || "",
   };
+}
+
+function prepSectionFromApi(section) {
+  return {
+    id: section.id,
+    label: section.label || "Untitled section",
+    short: section.short || "",
+    color: section.color || "#4f7b68",
+    description: section.description || "",
+    isBuiltin: Boolean(section.is_builtin),
+  };
+}
+
+export async function loadPrepSections(workspaceId) {
+  return (await api(`/prep-sections?workspace_id=${workspaceId}`)).map(prepSectionFromApi);
 }
 
 const roundToApi = (round) => ({
@@ -682,7 +624,7 @@ export function moduleReadiness(data, moduleId) {
   return Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 100);
 }
 
-export function overallReadiness(data, modules = MODULES) {
+export function overallReadiness(data, modules = []) {
   const scores = modules.map((module) => moduleReadiness(data, module.id)).filter((score) => score !== null);
   if (!scores.length) return null;
   return Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length);

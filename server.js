@@ -248,6 +248,59 @@ app.put("/api/workspaces/:id", (req, res) => {
   return res.json(db.prepare("SELECT id, company_name, role_title, created_at FROM workspaces WHERE id = ?").get(req.params.id));
 });
 
+function serializePrepSection(row) {
+  return {
+    id: row.module_key,
+    workspace_id: row.workspace_id,
+    label: row.label,
+    short: row.short || "",
+    color: row.color || "#4f7b68",
+    description: row.description || "",
+    sequence_order: row.sequence_order,
+    is_builtin: Boolean(row.is_builtin),
+  };
+}
+
+app.get("/api/prep-sections", (req, res) => {
+  const workspaceId = Number(req.query.workspace_id);
+  if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
+    return res.status(400).json({ error: "A valid workspace_id is required" });
+  }
+  const sections = db.prepare("SELECT * FROM prep_sections WHERE workspace_id = ? ORDER BY sequence_order, id").all(workspaceId);
+  return res.json(sections.map(serializePrepSection));
+});
+
+app.put("/api/prep-sections", (req, res) => {
+  const workspaceId = Number(req.query.workspace_id);
+  if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
+    return res.status(400).json({ error: "A valid workspace_id is required" });
+  }
+  const sections = Array.isArray(req.body?.sections) ? req.body.sections : [];
+  const normalized = sections.map((section, index) => ({
+    moduleKey: String(section.id || "").trim(),
+    label: String(section.label || "").trim(),
+    short: String(section.short || "").trim(),
+    color: String(section.color || "#4f7b68").trim(),
+    description: String(section.description || "").trim(),
+    sequenceOrder: index,
+    isBuiltin: section.isBuiltin ? 1 : 0,
+  }));
+  if (normalized.some((section) => !section.moduleKey || !section.label) || new Set(normalized.map((section) => section.moduleKey)).size !== normalized.length) {
+    return res.status(400).json({ error: "Each preparation section requires a unique id and label" });
+  }
+  db.transaction(() => {
+    db.prepare("DELETE FROM prep_sections WHERE workspace_id = ?").run(workspaceId);
+    const insert = db.prepare(`
+      INSERT INTO prep_sections
+        (workspace_id, module_key, label, short, color, description, sequence_order, is_builtin)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const section of normalized) insert.run(workspaceId, section.moduleKey, section.label, section.short, section.color, section.description, section.sequenceOrder, section.isBuiltin);
+  })();
+  const saved = db.prepare("SELECT * FROM prep_sections WHERE workspace_id = ? ORDER BY sequence_order, id").all(workspaceId);
+  return res.json(saved.map(serializePrepSection));
+});
+
 app.delete("/api/workspaces/:id", (req, res) => {
   const result = db.transaction(() => {
     const caseIds = db.prepare("SELECT id FROM case_framework_bank WHERE workspace_id = ?").all(req.params.id).map((row) => row.id);

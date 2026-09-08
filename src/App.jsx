@@ -1,6 +1,5 @@
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  MODULES,
   SCHEMA_VERSION,
   STATUSES,
   createInitialData,
@@ -11,6 +10,7 @@ import {
   overallReadiness,
   saveData,
   loadWorkspaceRounds,
+  loadPrepSections,
   createWorkspace,
   updateWorkspace,
   createInterviewRound,
@@ -270,9 +270,10 @@ function App() {
   const [saveState, setSaveState] = useState("Loading…");
   const [notice, setNotice] = useState("");
   const [activeRoundId, setActiveRoundIdState] = useState(null);
+  const [settingsPreparationFocus, setSettingsPreparationFocus] = useState(0);
   const importRef = useRef(null);
   const hydrated = useRef(false);
-  const modules = useMemo(() => data.settings.preparationModules || MODULES, [data.settings.preparationModules]);
+  const modules = useMemo(() => data.settings.preparationModules || [], [data.settings.preparationModules]);
   const activeWorkspace = data.workspaces?.find((workspace) => workspace.id === data.activeWorkspaceId) || data.workspaces?.[0] || null;
 
   useEffect(() => {
@@ -325,23 +326,25 @@ function App() {
   const searchResults = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return [];
-    const items = data.items.filter((item) => {
+    const availableModules = new Set(modules.map((module) => module.id));
+    const items = data.items.filter((item) => availableModules.has(item.module)).filter((item) => {
       const haystack = [item.title, item.type, ...(item.tags || []), ...Object.values(item.content || {})]
         .filter((value) => typeof value === "string")
         .join(" ")
         .toLowerCase();
       return haystack.includes(needle);
     }).map((item) => ({ ...item, kind: "item" }));
-    const trees = data.drillTrees.filter((tree) => {
+    const trees = data.drillTrees.filter((tree) => availableModules.has(tree.module)).filter((tree) => {
       const haystack = [tree.title, ...(tree.tags || []), ...tree.nodes.flatMap((node) => [node.question, node.myAnswer])]
         .join(" ")
         .toLowerCase();
       return haystack.includes(needle);
     }).map((tree) => ({ ...tree, kind: "drill" }));
     return [...items, ...trees];
-  }, [data, query]);
+  }, [data, modules, query]);
 
-  const navigate = (nextView) => {
+  const navigate = (nextView, options = {}) => {
+    setSettingsPreparationFocus((current) => nextView === "settings" && options.openPreparationSections ? current + 1 : 0);
     setView(nextView);
     setQuery("");
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -478,14 +481,14 @@ function App() {
     setSaveState("Loading…");
     try {
       await saveData(data);
-      const [rounds, content] = await Promise.all([loadWorkspaceRounds(workspaceId), loadRoundFilteredContent(null, workspaceId)]);
+      const [rounds, sections, content] = await Promise.all([loadWorkspaceRounds(workspaceId), loadPrepSections(workspaceId), loadRoundFilteredContent(null, workspaceId)]);
       setActiveRoundIdState(null);
       setData((current) => ({
         ...current,
         ...content,
         activeWorkspaceId: workspaceId,
         rounds,
-        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle },
+        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle, preparationModules: sections },
       }));
       setSaveState("Saved to SQLite");
       setNotice(`Switched to ${workspace.companyName}`);
@@ -500,7 +503,7 @@ function App() {
     try {
       await saveData(data);
       const workspace = await createWorkspace({ companyName: "New opportunity", roleTitle: "" });
-      const content = await loadRoundFilteredContent(null, workspace.id);
+      const [sections, content] = await Promise.all([loadPrepSections(workspace.id), loadRoundFilteredContent(null, workspace.id)]);
       setActiveRoundIdState(null);
       setData((current) => ({
         ...current,
@@ -508,7 +511,7 @@ function App() {
         workspaces: [...current.workspaces, workspace],
         activeWorkspaceId: workspace.id,
         rounds: [],
-        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle },
+        settings: { ...current.settings, companyName: workspace.companyName, roleTitle: workspace.roleTitle, preparationModules: sections },
       }));
       setNotice("Opportunity added");
     } catch (error) {
@@ -671,7 +674,7 @@ function App() {
         rounds: Array.isArray(parsed.rounds) ? parsed.rounds : data.rounds,
         settings: {
           ...parsed.settings,
-          preparationModules: parsed.settings.preparationModules || [...MODULES, ...(parsed.settings.customModules || [])],
+          preparationModules: parsed.settings.preparationModules || [],
         },
       });
       setNotice("Backup imported");
@@ -721,6 +724,7 @@ function App() {
             addRound={addRound}
             saveRound={saveRound}
             removeRound={removeRound}
+            focusPreparationSections={settingsPreparationFocus}
           />
         ) : module ? (
           <ModuleView
@@ -764,6 +768,7 @@ function Sidebar({ view, data, modules, onNavigate }) {
           <span className="nav-icon">★</span><span>Quick review</span>
         </button>
         <p className="nav-label">Preparation</p>
+        {modules.length === 0 && <div className="sidebar-sections-empty"><p>No preparation sections yet</p><button type="button" onClick={() => onNavigate("settings", { openPreparationSections: true })}>＋ Add a section</button></div>}
         {modules.map((module) => {
           const readiness = moduleReadiness(data, module.id);
           return (
@@ -802,17 +807,19 @@ function Dashboard({ data, modules, onNavigate }) {
   const { activeRoundId, setActiveRoundId } = useRoundFilter();
   const activeRound = data.rounds.find((round) => round.id === activeRoundId) || null;
   const overall = overallReadiness(data, modules);
+  const moduleIds = useMemo(() => new Set(modules.map((module) => module.id)), [modules]);
+  const workspaceItems = useMemo(() => data.items.filter((item) => moduleIds.has(item.module)), [data.items, moduleIds]);
   const focus = useMemo(() => {
     const rank = (item) => {
       if (item.starred && item.status !== "confident") return 1;
       if (item.priority === "high" && item.status !== "confident") return 2;
       return item.status === "confident" ? 5 : 4;
     };
-    return [...data.items]
+    return [...workspaceItems]
       .filter((item) => item.status !== "confident")
       .sort((a, b) => rank(a) - rank(b) || new Date(b.updatedAt) - new Date(a.updatedAt))
       .slice(0, 10);
-  }, [data.items]);
+  }, [workspaceItems]);
   const workspace = data.workspaces?.find((entry) => entry.id === data.activeWorkspaceId);
   const rounds = [...(data.rounds || [])].sort((a, b) => a.sequenceOrder - b.sequenceOrder || a.id - b.id);
   const nextRound = rounds
@@ -841,15 +848,16 @@ function Dashboard({ data, modules, onNavigate }) {
           <div className="readiness-content">
             <div className="readiness-ring" style={{ "--progress": `${overall ?? 0}%` }}><span><strong>{overall ?? 0}%</strong><small>ready</small></span></div>
             <div className="readiness-legend">
-              <p><span className="legend-dot confident" />Confident <strong>{data.items.filter((item) => item.status === "confident").length}</strong></p>
-              <p><span className="legend-dot reviewed" />Reviewed <strong>{data.items.filter((item) => item.status === "reviewed").length}</strong></p>
-              <p><span className="legend-dot not-started" />Not started <strong>{data.items.filter((item) => item.status === "not-started").length}</strong></p>
+              <p><span className="legend-dot confident" />Confident <strong>{workspaceItems.filter((item) => item.status === "confident").length}</strong></p>
+              <p><span className="legend-dot reviewed" />Reviewed <strong>{workspaceItems.filter((item) => item.status === "reviewed").length}</strong></p>
+              <p><span className="legend-dot not-started" />Not started <strong>{workspaceItems.filter((item) => item.status === "not-started").length}</strong></p>
             </div>
           </div>
         </article>
         <article className="panel focus-card">
           <div className="panel-heading"><div><p className="eyebrow">Focus today</p><h2>Highest-leverage work</h2>{activeRound && <FilterIndicator round={activeRound} clear={() => setActiveRoundId(null)} />}</div><span className="count-pill">{focus.length}</span></div>
           <div className="focus-list">
+            {modules.length === 0 && <div className="dashboard-sections-empty"><p>No preparation sections yet</p><button type="button" className="primary-button" onClick={() => onNavigate("settings", { openPreparationSections: true })}>＋ Add preparation section</button></div>}
             {focus.slice(0, 4).map((item) => {
               const module = modules.find((entry) => entry.id === item.module);
               return (
@@ -881,7 +889,7 @@ function Dashboard({ data, modules, onNavigate }) {
 
       <section className="modules-section">
         <div className="section-heading"><div><p className="eyebrow">Preparation sections</p><h2>Preparation map</h2></div><button className="text-button" onClick={() => onNavigate("quick-review")}>Open quick review →</button></div>
-        <div className="module-grid">
+        {modules.length === 0 ? <div className="empty-state preparation-sections-empty"><strong>No preparation sections yet</strong><p>Add the first section for this opportunity to start organizing preparation.</p><button type="button" className="primary-button" onClick={() => onNavigate("settings", { openPreparationSections: true })}>Add preparation section</button></div> : <div className="module-grid">
           {modules.map((module, index) => {
             const progress = moduleReadiness(data, module.id);
             const count = data.items.filter((item) => item.module === module.id).length;
@@ -896,7 +904,7 @@ function Dashboard({ data, modules, onNavigate }) {
               </button>
             );
           })}
-        </div>
+        </div>}
       </section>
     </main>
   );
@@ -935,7 +943,7 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
       </div>
       <section className="item-list">
         {items.length === 0 && <EmptyState onAdd={() => addItem(module.id, "question")} />}
-        {items.map((item, index) => <ItemEditor key={item.id} item={item} module={module} rounds={data.rounds} workspaceId={data.activeWorkspaceId} stageConfig={item.type === "case-framework" ? CASE_FRAMEWORK_STAGES : item.type === "story" ? STORY_STAGES : null} updateItem={updateItem} moveItem={moveItem} canMoveUp={index > 0} canMoveDown={index < items.length - 1} deleteItem={deleteItem} duplicateItem={duplicateItem} saveNow={saveNow} addImagesToItem={addImagesToItem} removeImageFromItem={removeImageFromItem} />)}
+        {items.map((item, index) => <ItemEditor key={item.id} item={item} module={module} modules={data.settings.preparationModules || []} rounds={data.rounds} workspaceId={data.activeWorkspaceId} stageConfig={item.type === "case-framework" ? CASE_FRAMEWORK_STAGES : item.type === "story" ? STORY_STAGES : null} updateItem={updateItem} moveItem={moveItem} canMoveUp={index > 0} canMoveDown={index < items.length - 1} deleteItem={deleteItem} duplicateItem={duplicateItem} saveNow={saveNow} addImagesToItem={addImagesToItem} removeImageFromItem={removeImageFromItem} />)}
       </section>
       {(module.id === "hiring-manager-simulation" || trees.length > 0) && (
         <DrillSection module={module} trees={trees} updateTree={updateTree} addTree={addTree} deleteTree={deleteTree} roundId={isSimulation ? selectedRoundId : null} rounds={data.rounds} />
@@ -1049,7 +1057,7 @@ function RoundTagPicker({ rounds, value = [], onChange }) {
   );
 }
 
-function ItemEditor({ item, module, rounds, workspaceId, stageConfig, updateItem, moveItem, canMoveUp, canMoveDown, deleteItem, duplicateItem, saveNow, addImagesToItem, removeImageFromItem }) {
+function ItemEditor({ item, module, modules, rounds, workspaceId, stageConfig, updateItem, moveItem, canMoveUp, canMoveDown, deleteItem, duplicateItem, saveNow, addImagesToItem, removeImageFromItem }) {
   const [open, setOpen] = useState(item.title.startsWith("Untitled"));
   const [tagInput, setTagInput] = useState(() => (item.tags || []).join(", "));
   const [previewImage, setPreviewImage] = useState(null);
@@ -1097,8 +1105,9 @@ function ItemEditor({ item, module, rounds, workspaceId, stageConfig, updateItem
             <button type="button" className={formMode === "preview" ? "active" : ""} aria-pressed={formMode === "preview"} onClick={() => setFormMode("preview")}>Preview</button>
           </div>}
           {(!supportsCombinedPreview || formMode === "edit") && <>
-          <div className="form-grid three">
+          <div className="form-grid four">
             <label>Title<input value={item.title} onChange={(event) => updateItem(item.id, { title: event.target.value })} /></label>
+            <label>Section<select value={item.module} onChange={(event) => updateItem(item.id, { module: event.target.value })}>{modules.map((section) => <option value={section.id} key={section.id}>{section.label}</option>)}</select></label>
             <label>Type<select value={item.type} onChange={(event) => {
               const type = event.target.value;
               updateItem(item.id, { type, itemType: type === "case-framework" ? "case_framework" : type === "story" ? "story" : item.itemType, workspaceId: type === "case-framework" ? workspaceId : item.workspaceId });
@@ -1249,7 +1258,11 @@ function PracticeDialog({ tree, close, updateTree }) {
           <div className="practice-question" key={node.id}>
             <small>{node.level === 0 ? "Root question" : `Follow-up ${node.level}`}</small>
             <h3>{node.question}</h3>
-            <RichTextEditor value={node.myAnswer} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: value } : entry) }))} placeholder="Practice your answer here…" ariaLabel={`Answer for ${node.question}`} />
+            <MarkdownContent value={node.myAnswer} emptyText="No prepared answer yet." />
+            <details>
+              <summary>Edit prepared answer</summary>
+              <RichTextEditor value={node.myAnswer} onChange={(value) => updateTree(tree.id, (current) => ({ ...current, nodes: current.nodes.map((entry) => entry.id === node.id ? { ...entry, myAnswer: value } : entry) }))} placeholder="Practice your answer here…" ariaLabel={`Answer for ${node.question}`} />
+            </details>
           </div>
         ))}
         <div className="dialog-actions">
@@ -1336,7 +1349,7 @@ function CollapsibleCard({ title, summary, expanded, onExpandedChange, className
   );
 }
 
-function Settings({ data, setData, exportData, importData, resetData, deletePreparationSection, reorderPreparationSections, selectWorkspace, addWorkspace, saveWorkspaceDetails, addRound, saveRound, removeRound }) {
+function Settings({ data, setData, exportData, importData, resetData, deletePreparationSection, reorderPreparationSections, selectWorkspace, addWorkspace, saveWorkspaceDetails, addRound, saveRound, removeRound, focusPreparationSections = 0 }) {
   const activeWorkspace = data.workspaces.find((workspace) => workspace.id === data.activeWorkspaceId) || data.workspaces[0];
   const [opportunityDraft, setOpportunityDraft] = useState(() => ({ companyName: activeWorkspace?.companyName || "", roleTitle: activeWorkspace?.roleTitle || "" }));
   const [roundDrafts, setRoundDrafts] = useState(() => data.rounds || []);
@@ -1346,6 +1359,12 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
     setOpportunityDraft({ companyName: activeWorkspace?.companyName || "", roleTitle: activeWorkspace?.roleTitle || "" });
   }, [activeWorkspace?.id, activeWorkspace?.companyName, activeWorkspace?.roleTitle]);
   useEffect(() => setRoundDrafts(data.rounds || []), [data.rounds]);
+  useEffect(() => setSectionDrafts(data.settings.preparationModules || []), [data.activeWorkspaceId, data.settings.preparationModules]);
+  useEffect(() => {
+    if (!focusPreparationSections) return;
+    setExpandedCards((current) => ({ ...current, preparation: true }));
+    window.requestAnimationFrame(() => document.querySelector(".preparation-settings")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }, [focusPreparationSections]);
   const setCardExpanded = (card, expanded) => setExpandedCards((current) => ({ ...current, [card]: expanded }));
   const expandedCount = Object.values(expandedCards).filter(Boolean).length;
   const expandAll = expandedCount <= 2;
@@ -1360,8 +1379,7 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
   const roundsSummary = roundDrafts.length === 0
     ? "No rounds added yet"
     : `${roundDrafts.length} round${roundDrafts.length === 1 ? "" : "s"}${nextRoundDraft ? ` · next: ${nextRoundDraft.label || "Untitled round"} on ${nextRoundDraft.scheduledDate ? formatDate(nextRoundDraft.scheduledDate) : "date not set"}` : " · no upcoming round"}`;
-  const builtinIds = new Set(MODULES.map((module) => module.id));
-  const builtinCount = sectionDrafts.filter((section) => builtinIds.has(section.id)).length;
+  const builtinCount = sectionDrafts.filter((section) => section.isBuiltin).length;
   const customCount = sectionDrafts.length - builtinCount;
   const updateRoundDraft = (id, patch) => setRoundDrafts((current) => current.map((round) => round.id === id ? { ...round, ...patch } : round));
   const addRoundDraft = () => setRoundDrafts((current) => [...current, {
@@ -1397,6 +1415,7 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
       short: "",
       color: CUSTOM_MODULE_COLORS[current.length % CUSTOM_MODULE_COLORS.length],
       description: "",
+      isBuiltin: false,
     }]);
   };
   const updateSectionDraft = (id, patch) => setSectionDrafts((current) => current.map((section) => section.id === id ? { ...section, ...patch } : section));
@@ -1482,7 +1501,7 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
       <CollapsibleCard title="Preparation Sections" summary={`${sectionDrafts.length} sections (${builtinCount} built-in, ${customCount} custom)`} expanded={expandedCards.preparation} onExpandedChange={(expanded) => setCardExpanded("preparation", expanded)} className="preparation-settings">
         <p className="settings-card-intro">Create, edit, and reorder every preparation section shown in the sidebar and preparation map.</p>
         <div className="preparation-draft-list">
-          {sectionDrafts.length === 0 && <p className="muted">No custom preparation sections yet. Use the plus button to add one.</p>}
+          {sectionDrafts.length === 0 && <p className="muted">No preparation sections yet. Use the plus button to add one.</p>}
           {sectionDrafts.map((draft) => {
             const isSaved = (data.settings.preparationModules || []).some((section) => section.id === draft.id);
             return (

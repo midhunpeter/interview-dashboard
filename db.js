@@ -31,6 +31,22 @@ db.exec(`
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS prep_sections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    module_key TEXT NOT NULL,
+    label TEXT NOT NULL,
+    short TEXT,
+    color TEXT,
+    description TEXT,
+    sequence_order INTEGER NOT NULL DEFAULT 0,
+    is_builtin INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, module_key)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_prep_sections_workspace ON prep_sections(workspace_id, sequence_order);
+
   CREATE TABLE IF NOT EXISTS interview_rounds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -271,5 +287,59 @@ if (!migrationComplete) {
       INSERT INTO app_metadata (resource, record_id, value) VALUES ('migration', 1, ?)
       ON CONFLICT(resource, record_id) DO UPDATE SET value = excluded.value
     `).run(migrationKey);
+  })();
+}
+
+const legacyPrepSectionsMigrationKey = "workspace-prep-sections-v1";
+const legacyPrepSectionsMigrationComplete = db.prepare("SELECT 1 FROM app_metadata WHERE resource = 'migration' AND record_id = 2 AND value = ?").get(legacyPrepSectionsMigrationKey);
+
+if (!legacyPrepSectionsMigrationComplete) {
+  db.transaction(() => {
+    const defaultWorkspace = db.prepare("SELECT id FROM workspaces ORDER BY id LIMIT 1").get();
+    const legacyBuiltins = [
+      { id: "positioning", label: "Positioning", short: "PO", color: "#9e6a50", description: "Build a crisp story for why your background fits this team." },
+      { id: "scheduling-machine", label: "Scheduling Machine", short: "SM", color: "#6c7f6b", description: "Show genuine technical ownership, decisions, scale, and lessons." },
+      { id: "pm-depth", label: "Technical PM Depth", short: "TP", color: "#5d7397", description: "Prepare for deep questions on APIs, data, rules, and integrations." },
+      { id: "platform-reliability", label: "Platform Reliability", short: "PR", color: "#8c6c87", description: "Practice operational maturity, integrity, and observability." },
+      { id: "internal-platform-pm", label: "Internal Platform PM", short: "IP", color: "#82714d", description: "Frame other teams as customers and prove adoption thinking." },
+      { id: "healthcare-interoperability", label: "Healthcare Interop", short: "HI", color: "#477a75", description: "Review standards, workflows, regulation, and domain examples." },
+      { id: "data-platform-translation", label: "Data Platform Translation", short: "DT", color: "#936251", description: "Map Scheduling Machine lessons to Tempus platform problems." },
+      { id: "hiring-manager-simulation", label: "HM Simulation", short: "HM", color: "#606a88", description: "Rehearse progressive technical drilling and follow-up pressure." },
+    ];
+    const builtinKeys = new Set(legacyBuiltins.map((section) => section.id));
+    const settingsMetadataRow = db.prepare("SELECT value FROM app_metadata WHERE resource = 'settings' AND record_id = 1").get();
+    let settingsMetadata = {};
+    try { settingsMetadata = settingsMetadataRow ? JSON.parse(settingsMetadataRow.value) : {}; } catch { settingsMetadata = {}; }
+    const legacySections = Array.isArray(settingsMetadata.preparationModules) && settingsMetadata.preparationModules.length
+      ? settingsMetadata.preparationModules
+      : legacyBuiltins;
+
+    if (defaultWorkspace && db.prepare("SELECT count(*) AS count FROM prep_sections").get().count === 0) {
+      const insertSection = db.prepare(`
+        INSERT OR IGNORE INTO prep_sections
+          (workspace_id, module_key, label, short, color, description, sequence_order, is_builtin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      legacySections.forEach((section, index) => insertSection.run(
+        defaultWorkspace.id,
+        section.id,
+        section.label || "Untitled section",
+        section.short || "",
+        section.color || "#4f7b68",
+        section.description || "",
+        index,
+        builtinKeys.has(section.id) ? 1 : 0,
+      ));
+    }
+
+    if (Object.prototype.hasOwnProperty.call(settingsMetadata, "preparationModules") || Object.prototype.hasOwnProperty.call(settingsMetadata, "customModules")) {
+      delete settingsMetadata.preparationModules;
+      delete settingsMetadata.customModules;
+      db.prepare("UPDATE app_metadata SET value = ? WHERE resource = 'settings' AND record_id = 1").run(JSON.stringify(settingsMetadata));
+    }
+    db.prepare(`
+      INSERT INTO app_metadata (resource, record_id, value) VALUES ('migration', 2, ?)
+      ON CONFLICT(resource, record_id) DO UPDATE SET value = excluded.value
+    `).run(legacyPrepSectionsMigrationKey);
   })();
 }

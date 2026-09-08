@@ -14,11 +14,36 @@ import TableCell from "@tiptap/extension-table-cell";
 import TableHeader from "@tiptap/extension-table-header";
 import Link from "@tiptap/extension-link";
 
-const markdownOptions = { breaks: true, gfm: false };
+const markdownOptions = { breaks: true, gfm: true };
 const sanitizeOptions = {
-  ALLOWED_TAGS: ["p", "br", "strong", "em", "ul", "li"],
+  ALLOWED_TAGS: [
+    "p", "br", "strong", "em", "ul", "ol", "li", "del", "s", "u", "mark",
+    "table", "thead", "tbody", "tr", "th", "td", "pre", "code",
+    "h1", "h2", "h3", "blockquote", "hr", "a", "input",
+  ],
   ALLOWED_ATTR: [],
+  ADD_ATTR: (attribute, tag) => (
+    (tag === "a" && ["href", "title"].includes(attribute))
+    || (tag === "code" && attribute === "class")
+    || (tag === "input" && ["type", "disabled", "checked"].includes(attribute))
+    || (["th", "td"].includes(tag) && attribute === "align")
+  ),
+  ALLOW_DATA_ATTR: false,
+  ALLOW_ARIA_ATTR: false,
 };
+
+// Use a dedicated sanitizer so these read-only rules cannot affect other HTML.
+const markdownSanitizer = DOMPurify();
+markdownSanitizer.addHook("uponSanitizeElement", (node) => {
+  if (node.nodeName !== "INPUT") return;
+  if (node.getAttribute("type")?.toLowerCase() !== "checkbox") node.remove();
+  else node.setAttribute("disabled", "");
+});
+markdownSanitizer.addHook("uponSanitizeAttribute", (node, attribute) => {
+  if (attribute.attrName === "class") {
+    attribute.keepAttr = node.nodeName === "CODE" && /^language-[\w.+#-]+$/.test(attribute.attrValue);
+  }
+});
 
 const richTextExtensions = [
   StarterKit.configure({ heading: { levels: [1, 2, 3] }, link: false, underline: false }),
@@ -35,7 +60,7 @@ const richTextExtensions = [
 ];
 
 export function renderMarkdown(value = "") {
-  return DOMPurify.sanitize(marked.parse(String(value), markdownOptions), sanitizeOptions);
+  return markdownSanitizer.sanitize(marked.parse(String(value), markdownOptions), sanitizeOptions);
 }
 
 export function MarkdownContent({ value, className = "", emptyText = "" }) {

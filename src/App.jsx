@@ -1,6 +1,5 @@
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  SCHEMA_VERSION,
   STATUSES,
   createInitialData,
   createId,
@@ -18,6 +17,8 @@ import {
   deleteInterviewRound,
   uploadItemImage,
   deleteItemImage,
+  queueItemDeletion, queueTreeDeletion, exportBackup, previewBackup, restoreBackup, resetDataset,
+  getUnsavedDrafts, latestConflictVersion, resolveDataConflict,
 } from "./data";
 import { RichTextEditor, MarkdownContent } from "./markdown";
 import { CASE_FRAMEWORK_STAGES } from "../caseFramework.js";
@@ -61,7 +62,10 @@ const isSchedulingOverview = (item) => item.module === "scheduling-machine"
 
 function itemMarkdownSections(item) {
   const content = item.content || {};
-  if (item.type === "case-framework") return CASE_FRAMEWORK_STAGES.map(({ key, label }) => [label, content[key]]);
+  if (item.type === "case-framework") return [
+    ...CASE_FRAMEWORK_STAGES.map(({ key, label }) => [label, content[key]]),
+    ...(item.legacyAnswers || []).map((answer) => [`Legacy answers — ${answer.stage} (${answer.source})`, answer.answer]),
+  ];
   if (item.type === "story") return [
     ["Situation", content.situation],
     ["Task", content.task],
@@ -157,6 +161,7 @@ function previewShapeForItem(item, stageConfig = []) {
     sections: [
       { label: "Case Study", content: (item.usedFor || []).join("\n") },
       ...sectionsFromStageConfig(item, stageConfig),
+      ...(item.legacyAnswers || []).map((answer) => ({ label: `Legacy answers — ${answer.stage} (${answer.source})`, content: answer.answer })),
     ],
   };
   if (item.type === "question") return {
@@ -237,6 +242,50 @@ function CombinedPreviewModal({ preview, close }) {
   );
 }
 
+function downloadJSON(payload, name) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${name}-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function ConflictDialog({ error, resolve, downloadDraft }) {
+  const [latest, setLatest] = useState(null);
+  const [message, setMessage] = useState("");
+  const [resolving, setResolving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setLatest(null);
+    latestConflictVersion(error).then((value) => { if (!cancelled) setLatest(value); }).catch((failure) => { if (!cancelled) setMessage(failure.message); });
+    return () => { cancelled = true; };
+  }, [error]);
+  const choose = async (choice) => {
+    setResolving(true);
+    try { await resolve(choice, latest); }
+    catch (failure) { setMessage(failure.message); }
+    finally { setResolving(false); }
+  };
+  return <div className="dialog-backdrop" role="presentation">
+    <section className="combined-preview-dialog conflict-dialog" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
+      <h2 id="conflict-title">Save conflict — your draft is kept</h2>
+      <p>{error.message}</p>
+      <p className="muted">No automatic retry will overwrite the saved version. Download a copy before discarding your draft.</p>
+      <div className="conflict-comparison">
+        <section><h3>Your unsaved changes</h3><pre>{JSON.stringify(getUnsavedDrafts(), null, 2)}</pre></section>
+        <section><h3>Latest saved version</h3><pre>{latest ? JSON.stringify(latest, null, 2) : "Loading saved version…"}</pre></section>
+      </div>
+      {message && <p role="alert">{message}</p>}
+      <div className="button-row">
+        <button className="secondary-button" autoFocus onClick={downloadDraft}>Download unsaved draft</button>
+        <button className="secondary-button" disabled={resolving || !latest} onClick={() => choose("saved")}>Load saved version</button>
+        {error.code !== "DATASET_CHANGED" && !latest?.deleted && <button className="primary-button" disabled={resolving || !latest} onClick={() => choose("retry")}>Retry my changes against this version</button>}
+      </div>
+    </section>
+  </div>;
+}
+
 const makeItem = (moduleId, itemType = "question", workspaceId = null, roundId = null) => {
   const timestamp = new Date().toISOString();
   const isCaseFramework = itemType === "case-framework";
@@ -271,8 +320,30 @@ function App() {
   const [notice, setNotice] = useState("");
   const [activeRoundId, setActiveRoundIdState] = useState(null);
   const [settingsPreparationFocus, setSettingsPreparationFocus] = useState(0);
+  const [conflict, setConflict] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const operationLock = useRef(false);
+  const currentData = useRef(data);
+  currentData.current = data;
   const importRef = useRef(null);
   const hydrated = useRef(false);
+  const reportSaveError = (error) => {
+    setSaveState(error.status === 409 ? "Conflict — draft kept" : "Save failed");
+    setNotice(error.message || "Save failed");
+  };
+  const beginOperation = () => {
+    if (operationLock.current) return false;
+    operationLock.current = true;
+    setBusy(true);
+    return true;
+  };
+  const endOperation = () => { operationLock.current = false; setBusy(false); };
+
+  useEffect(() => {
+    const listener = (event) => { setConflict(event.detail); setSaveState("Conflict — draft kept"); };
+    window.addEventListener("data-conflict", listener);
+    return () => window.removeEventListener("data-conflict", listener);
+  }, []);
   const modules = useMemo(() => data.settings.preparationModules || [], [data.settings.preparationModules]);
   const activeWorkspace = data.workspaces?.find((workspace) => workspace.id === data.activeWorkspaceId) || data.workspaces?.[0] || null;
 
@@ -293,18 +364,19 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!hydrated.current) return undefined;
+    if (!hydrated.current || busy || conflict) return undefined;
+    let cancelled = false;
     setSaveState("Saving…");
     const timer = window.setTimeout(() => {
       saveData(data)
-        .then(() => setSaveState("Saved to SQLite"))
+        .then(() => { if (!cancelled && currentData.current === data) setSaveState("Saved to SQLite"); })
         .catch((error) => {
           console.error(error);
-          setSaveState("Save failed");
+          if (!cancelled) reportSaveError(error);
         });
     }, 350);
-    return () => window.clearTimeout(timer);
-  }, [data]);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [data, busy, conflict]);
 
   useEffect(() => {
     if (!notice) return undefined;
@@ -381,15 +453,9 @@ function App() {
   const deleteItem = async (id) => {
     const item = data.items.find((entry) => entry.id === id);
     if (!item || !window.confirm(`Delete “${item.title}”?`)) return;
-    try {
-      await Promise.all((item.images || []).map((image) => deleteItemImage(image.id)));
-    } catch (error) {
-      console.error(error);
-      setNotice("Item could not be deleted");
-      return;
-    }
+    queueItemDeletion(item);
     setData((current) => ({ ...current, items: current.items.filter((entry) => entry.id !== id) }));
-    setNotice("Item deleted");
+    setNotice("Item deletion queued");
   };
 
   const duplicateItem = (item) => {
@@ -410,6 +476,7 @@ function App() {
   const addImagesToItem = async (itemId, fileList) => {
     const files = [...fileList];
     if (!files.length) return;
+    if (!beginOperation()) return;
     setSaveState("Saving…");
     try {
       await saveData(data);
@@ -423,13 +490,13 @@ function App() {
       setNotice(`${uploaded.length} image${uploaded.length === 1 ? "" : "s"} added`);
     } catch (error) {
       console.error(error);
-      setSaveState("Save failed");
-      setNotice(error.message || "Image upload failed");
-    }
+      reportSaveError(error);
+    } finally { endOperation(); }
   };
 
   const removeImageFromItem = async (itemId, image) => {
     if (!window.confirm(`Delete “${image.filename}”?`)) return;
+    if (!beginOperation()) return;
     try {
       await deleteItemImage(image.id);
       setData((current) => ({
@@ -439,21 +506,20 @@ function App() {
       setNotice("Image deleted");
     } catch (error) {
       console.error(error);
-      setNotice(error.message || "Image delete failed");
-    }
+      reportSaveError(error);
+    } finally { endOperation(); }
   };
 
   const saveNow = async (snapshot = data) => {
     setSaveState("Saving…");
     try {
       await saveData(snapshot);
-      setSaveState("Saved to SQLite");
+      if (currentData.current === snapshot) setSaveState("Saved to SQLite");
       setNotice("Preparation saved");
       return true;
     } catch (error) {
       console.error(error);
-      setSaveState("Save failed");
-      setNotice("Save failed");
+      reportSaveError(error);
       return false;
     }
   };
@@ -461,6 +527,7 @@ function App() {
   const changeRoundFilter = async (roundId) => {
     const nextRoundId = Number.isInteger(roundId) && roundId > 0 ? roundId : null;
     if (nextRoundId === activeRoundId) return;
+    if (!beginOperation()) return;
     setSaveState("Loading…");
     try {
       await saveData(data);
@@ -470,14 +537,14 @@ function App() {
       setSaveState("Saved to SQLite");
     } catch (error) {
       console.error(error);
-      setSaveState("Load failed");
-      setNotice("Round filter could not be applied");
-    }
+      reportSaveError(error);
+    } finally { endOperation(); }
   };
 
   const selectWorkspace = async (workspaceId) => {
     const workspace = data.workspaces.find((entry) => entry.id === workspaceId);
     if (!workspace || workspaceId === data.activeWorkspaceId) return;
+    if (!beginOperation()) return;
     setSaveState("Loading…");
     try {
       await saveData(data);
@@ -494,12 +561,12 @@ function App() {
       setNotice(`Switched to ${workspace.companyName}`);
     } catch (error) {
       console.error(error);
-      setSaveState("Load failed");
-      setNotice("Opportunity could not be loaded");
-    }
+      reportSaveError(error);
+    } finally { endOperation(); }
   };
 
   const addWorkspace = async () => {
+    if (!beginOperation()) return;
     try {
       await saveData(data);
       const workspace = await createWorkspace({ companyName: "New opportunity", roleTitle: "" });
@@ -516,12 +583,13 @@ function App() {
       setNotice("Opportunity added");
     } catch (error) {
       console.error(error);
-      setNotice("Opportunity could not be added");
-    }
+      reportSaveError(error);
+    } finally { endOperation(); }
   };
 
   const saveWorkspaceDetails = async (values) => {
     if (!data.activeWorkspaceId) return false;
+    if (!beginOperation()) return false;
     try {
       const workspace = await updateWorkspace(data.activeWorkspaceId, values);
       setData((current) => ({
@@ -533,12 +601,13 @@ function App() {
       return true;
     } catch (error) {
       console.error(error);
-      setNotice("Opportunity could not be saved");
+      reportSaveError(error);
       return false;
-    }
+    } finally { endOperation(); }
   };
 
   const addRound = async (round) => {
+    if (!beginOperation()) return null;
     try {
       const created = await createInterviewRound(data.activeWorkspaceId, round);
       setData((current) => ({ ...current, rounds: [...current.rounds, created] }));
@@ -546,12 +615,13 @@ function App() {
       return created;
     } catch (error) {
       console.error(error);
-      setNotice("Interview round could not be added");
+      reportSaveError(error);
       return null;
-    }
+    } finally { endOperation(); }
   };
 
   const saveRound = async (round) => {
+    if (!beginOperation()) return null;
     try {
       const saved = await updateInterviewRound(data.activeWorkspaceId, round);
       setData((current) => ({ ...current, rounds: current.rounds.map((entry) => entry.id === saved.id ? saved : entry) }));
@@ -559,17 +629,18 @@ function App() {
       return saved;
     } catch (error) {
       console.error(error);
-      setNotice("Interview round could not be saved");
+      reportSaveError(error);
       return null;
-    }
+    } finally { endOperation(); }
   };
 
   const removeRound = async (round) => {
     if (!window.confirm(`Delete “${round.label}”? Its drill trees will become general preparation.`)) return false;
+    if (!beginOperation()) return false;
     try {
       await saveData(data);
       await deleteInterviewRound(data.activeWorkspaceId, round.id);
-      const content = activeRoundId === round.id ? await loadRoundFilteredContent(null, data.activeWorkspaceId) : null;
+      const content = await loadRoundFilteredContent(activeRoundId === round.id ? null : activeRoundId, data.activeWorkspaceId);
       if (activeRoundId === round.id) setActiveRoundIdState(null);
       setData((current) => ({
         ...current,
@@ -582,30 +653,45 @@ function App() {
       return true;
     } catch (error) {
       console.error(error);
-      setNotice("Interview round could not be deleted");
+      reportSaveError(error);
       return false;
-    }
+    } finally { endOperation(); }
   };
 
   const deletePreparationSection = async (sectionId) => {
     const section = (data.settings.preparationModules || []).find((entry) => entry.id === sectionId);
     if (section && !window.confirm(`Delete the “${section.label}” preparation section and all of its items?`)) return false;
+    // Load the unfiltered set after saving drafts so explicit section deletion
+    // includes hidden rows too. Ordinary filter changes never enqueue deletes.
+    if (!beginOperation()) return false;
+    try {
+    await saveData(data);
+    const all = await loadRoundFilteredContent(null, data.activeWorkspaceId);
+    for (const item of all.items.filter((entry) => entry.module === sectionId)) queueItemDeletion(item);
+    for (const tree of all.drillTrees.filter((entry) => entry.module === sectionId)) queueTreeDeletion(tree);
     const nextData = {
       ...data,
       settings: { ...data.settings, preparationModules: (data.settings.preparationModules || []).filter((entry) => entry.id !== sectionId) },
-      items: data.items.filter((item) => item.module !== sectionId),
-      drillTrees: data.drillTrees.filter((tree) => tree.module !== sectionId),
+      items: all.items.filter((item) => item.module !== sectionId && (!activeRoundId || !item.roundIds?.length || item.roundIds.includes(activeRoundId))),
+      drillTrees: all.drillTrees.filter((tree) => tree.module !== sectionId && (!activeRoundId || tree.roundId == null || tree.roundId === activeRoundId)),
     };
+    setData(nextData);
     const saved = await saveNow(nextData);
     if (saved) setData(nextData);
     return saved;
+    } catch (error) { reportSaveError(error); return false; }
+    finally { endOperation(); }
   };
 
   const reorderPreparationSections = async (preparationModules) => {
+    if (!beginOperation()) return false;
+    try {
     const nextData = { ...data, settings: { ...data.settings, preparationModules } };
+    setData(nextData);
     const saved = await saveNow(nextData);
     if (saved) setData(nextData);
     return saved;
+    } finally { endOperation(); }
   };
 
   const updateTree = (treeId, updater) => {
@@ -639,55 +725,76 @@ function App() {
   const deleteTree = (treeId) => {
     const tree = data.drillTrees.find((entry) => entry.id === treeId);
     if (!tree || !window.confirm(`Delete drill tree “${tree.title}”?`)) return;
+    queueTreeDeletion(tree);
     setData((current) => ({ ...current, drillTrees: current.drillTrees.filter((entry) => entry.id !== treeId) }));
-    setNotice("Drill tree deleted");
+    setNotice("Drill tree deletion queued");
   };
 
-  const exportData = () => {
-    const payload = { ...data, exportedAt: new Date().toISOString() };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `interview-prep-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    setNotice("Backup exported");
+  const exportData = async () => {
+    if (!beginOperation()) return;
+    try {
+      await saveData(currentData.current);
+      downloadJSON(await exportBackup(), "interview-prep-complete-backup");
+      setNotice("Complete backup exported — all workspaces and image bytes included");
+    } catch (error) { reportSaveError(error); }
+    finally { endOperation(); }
   };
 
   const importData = async (event) => {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
+    if (!beginOperation()) return;
     try {
+      if (file.size > 256 * 1024 * 1024) throw new Error("Backups may be up to 256 MB.");
       const parsed = JSON.parse(await file.text());
-      if (parsed.schemaVersion !== SCHEMA_VERSION || !Array.isArray(parsed.items) || !Array.isArray(parsed.drillTrees) || !parsed.settings) {
-        throw new Error("This file is not a valid dashboard backup.");
-      }
-      const summary = `${parsed.items.length} items and ${parsed.drillTrees.length} drill trees`;
-      if (!window.confirm(`Import ${summary}? This will replace the current dashboard after a backup is downloaded.`)) return;
-      exportData();
-      setData({
-        ...parsed,
-        workspaces: Array.isArray(parsed.workspaces) && parsed.workspaces.length ? parsed.workspaces : data.workspaces,
-        activeWorkspaceId: parsed.activeWorkspaceId || data.activeWorkspaceId,
-        rounds: Array.isArray(parsed.rounds) ? parsed.rounds : data.rounds,
-        settings: {
-          ...parsed.settings,
-          preparationModules: parsed.settings.preparationModules || [],
-        },
-      });
-      setNotice("Backup imported");
+      const preview = await previewBackup(parsed);
+      const summary = Object.entries(preview.counts).map(([table, count]) => `${table.replaceAll("_", " ")}: ${count}`).join("\n");
+      if (!window.confirm(`Replace ALL workspaces, not just the current view?\n\n${summary}\nImage bytes: ${preview.imageBytes.toLocaleString()}\n\nPending edits will be saved first. A verified recovery database will be kept on the server before replacement. Continue?`)) return;
+      await saveData(currentData.current);
+      const result = await restoreBackup(parsed);
+      setData(result.data);
+      setActiveRoundIdState(null);
+      setView("settings");
+      setSaveState("Saved to SQLite");
+      window.alert(`Backup restored successfully. Recovery database: ${result.recoveryPath}`);
     } catch (error) {
       window.alert(error.message || "The selected backup could not be imported.");
-    }
+      reportSaveError(error);
+    } finally { endOperation(); }
+  };
+
+  const resetData = async () => {
+    if (!window.confirm("Reset ALL workspaces and their content to one empty opportunity? A verified recovery database will be kept on the server.")) return;
+    if (!beginOperation()) return;
+    try {
+      await saveData(currentData.current);
+      const result = await resetDataset();
+      setData(result.data);
+      setActiveRoundIdState(null);
+      setView("settings");
+      window.alert(`Dashboard reset. Recovery database: ${result.recoveryPath}`);
+    } catch (error) { reportSaveError(error); }
+    finally { endOperation(); }
+  };
+
+  const resolveConflict = async (choice, latest) => {
+    // Capture text typed after the request that first encountered the conflict.
+    await saveData(currentData.current).catch(() => {});
+    try {
+      const loaded = await resolveDataConflict(choice, latest);
+      setData(loaded);
+      setActiveRoundIdState(null);
+      setConflict(null);
+      setSaveState("Saved to SQLite");
+    } catch (error) { reportSaveError(error); throw error; }
   };
 
   const module = modules.find((entry) => entry.id === view);
 
   return (
     <RoundFilterContext.Provider value={{ activeRoundId, setActiveRoundId: changeRoundFilter }}>
-    <div className="app-shell">
+    <div className="app-shell" inert={busy || conflict ? true : undefined}>
       <Sidebar view={view} data={data} modules={modules} onNavigate={navigate} />
       <div className="workspace">
         <Header
@@ -710,12 +817,7 @@ function App() {
             setData={setData}
             exportData={exportData}
             importData={() => importRef.current?.click()}
-            resetData={() => {
-              if (window.confirm("Reset the dashboard to its starter content? Export a backup first if you need the current data.")) {
-                setData(createInitialData());
-                setNotice("Dashboard reset");
-              }
-            }}
+            resetData={resetData}
             deletePreparationSection={deletePreparationSection}
             reorderPreparationSections={reorderPreparationSections}
             selectWorkspace={selectWorkspace}
@@ -748,6 +850,8 @@ function App() {
       <input ref={importRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={importData} />
       {notice && <div className="toast" role="status">{notice}</div>}
     </div>
+    {busy && <div className="data-operation-status" role="status">Finishing database operation…</div>}
+    {conflict && <ConflictDialog error={conflict} resolve={resolveConflict} downloadDraft={() => downloadJSON({ ...getUnsavedDrafts(), visibleDraft: currentData.current }, "interview-prep-unsaved-draft")} />}
     </RoundFilterContext.Provider>
   );
 }
@@ -997,7 +1101,12 @@ function StoryForm({ item, setContent, stageConfig = STORY_STAGES }) {
 }
 
 function CaseFrameworkForm({ item, setContent, stageConfig = CASE_FRAMEWORK_STAGES }) {
-  return <StagedNarrativeFields item={item} setContent={setContent} stageConfig={stageConfig} />;
+  return <><StagedNarrativeFields item={item} setContent={setContent} stageConfig={stageConfig} />
+    {item.legacyAnswers?.length > 0 && <details className="legacy-answers"><summary>Legacy answers ({item.legacyAnswers.length})</summary>
+      <p className="muted">Original four-stage answers, preserved verbatim. Column and metadata versions are kept separately; the seven current stages are unchanged.</p>
+      {item.legacyAnswers.map((answer, index) => <section key={index}><h4>{answer.stage} · {answer.source}</h4><pre>{answer.answer}</pre></section>)}
+    </details>}
+  </>;
 }
 
 function ItemLongTextFields({ item, setContent, stageConfig }) {
@@ -1526,10 +1635,10 @@ function Settings({ data, setData, exportData, importData, resetData, deletePrep
         </div>
         <button className="add-preparation-button" onClick={addSectionDraft}><span>＋</span>Add another preparation section</button>
       </CollapsibleCard>
-      <CollapsibleCard title="Local Data & Backup" summary="Export, import, or reset this workspace's data" expanded={expandedCards.localData} onExpandedChange={(expanded) => setCardExpanded("localData", expanded)}>
-        <p>This dashboard stores data in a local SQLite database on this laptop. Export a backup regularly.</p>
+      <CollapsibleCard title="Local Data & Backup" summary="Complete backup, restore, or reset of all workspaces" expanded={expandedCards.localData} onExpandedChange={(expanded) => setCardExpanded("localData", expanded)}>
+        <p>Backups include every workspace, round, preparation item and image byte, regardless of the current filter. Import and reset replace the entire dataset, after a verified recovery database is created on the server.</p>
         <div className="button-row"><button className="primary-button" onClick={exportData}>Export JSON backup</button><button className="secondary-button" onClick={importData}>Import JSON backup</button><button className="danger-button" onClick={resetData}>Reset dashboard</button></div>
-        <small>Schema version {SCHEMA_VERSION} · {data.items.length} items · {data.drillTrees.length} drill tree{data.drillTrees.length === 1 ? "" : "s"}</small>
+        <small>Complete backup format v1 · 256 MB maximum import · legacy browser-state exports require manual recovery</small>
       </CollapsibleCard>
     </main>
   );

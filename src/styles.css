@@ -224,3 +224,10 @@ h3 { margin-bottom: 6px; }
   .markdown-content pre, .markdown-content pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
   .markdown-content table { table-layout: fixed; overflow-wrap: anywhere; }
 }
+/* Reliability controls use the existing modal/card palette. */
+.data-operation-status { position: fixed; inset: auto 24px 24px auto; z-index: 1000; padding: 16px 22px; border-radius: 9px; background: #203d34; color: #fffefa; box-shadow: 0 4px 24px #0003; }
+.conflict-dialog { max-height: 90vh; overflow: auto; padding: 28px; }
+.conflict-comparison { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+.conflict-comparison pre, .legacy-answers pre { max-height: 42vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border-radius: 7px; background: #f3f1eb; font-size: 12px; }
+.legacy-answers { margin: 12px 0; padding: 14px; background: #f8f6ef; border: 1px solid #ddd9cf; border-radius: 9px; }
+.legacy-answers summary { cursor: pointer; font-weight: 700; }

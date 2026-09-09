@@ -33,20 +33,89 @@ export function createInitialData() {
 const itemIdentities = new Map();
 const treeIdentities = new Map();
 const followupIdentities = new Map();
-let saveQueue = Promise.resolve();
+const imageOwners = new Map();
+const versions = new Map();
+const baselines = new Map();
+const pending = new Map();
+let datasetGeneration;
+let epoch = 0;
+let running;
+let blocked;
 let initialLoadPromise;
 
+function hasPendingPath(path) {
+  return [...pending.values()].some((job) => {
+    if (job.path === path) return true;
+    if (job.kind === "item") {
+      const identity = itemIdentities.get(job.value.id);
+      return identity && path === (identity.resource === "scheduling-machine" ? "/scheduling-machine" : `/${identity.resource}/${identity.dbId}`);
+    }
+    return job.kind === "tree" && path === `/drill-trees/${treeIdentities.get(job.value.id)}`;
+  });
+}
+
 async function api(path, options = {}) {
+  const requestEpoch = epoch;
+  const method = options.method || "GET";
+  const writing = method !== "GET" && !path.endsWith("/preview");
+  if (writing && blocked) throw blocked;
+  const headers = { ...(options.body ? { "Content-Type": "application/json" } : {}), ...options.headers };
+  if (writing) {
+    headers["X-Dataset-Generation"] = datasetGeneration;
+    if (method === "PUT" || method === "DELETE") headers["If-Match"] = String(versions.get(path) ?? -1);
+    if (options.ownerPath) headers["If-Match-Owner"] = String(versions.get(options.ownerPath) ?? -1);
+  }
   const response = await fetch(`/api${path}`, {
-    headers: options.body ? { "Content-Type": "application/json" } : undefined,
     ...options,
+    headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
+  if (requestEpoch !== epoch) throw new Error("Ignored a response from an earlier dataset");
+  const token = response.headers.get("X-Dataset-Generation");
+  const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
+  const responseRevision = response.headers.get("X-Record-Revision");
+  if (responseRevision != null) options.onRevision?.(Number(responseRevision));
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || `Request failed (${response.status})`);
+    const error = Object.assign(new Error(payload.error || `Request failed (${response.status})`), payload, { path, options, status: response.status,
+      comparisonPath: options.ownerPath && payload.resource !== "item-images" ? options.ownerPath : path,
+    });
+    if (response.status === 409) publishConflict(error);
+    throw error;
   }
-  return response.status === 204 ? null : response.json();
+  if (!options.allowGenerationChange && datasetGeneration && token && token !== datasetGeneration) {
+    const error = Object.assign(new Error("The dataset was replaced. Your unsaved draft is still available below."), { code: "DATASET_CHANGED", path, options, status: 409 });
+    publishConflict(error);
+    throw error;
+  }
+  if (!datasetGeneration) datasetGeneration = token;
+  if (options.track !== false) {
+    const ownerPath = response.headers.get("X-Owner-Path");
+    if (ownerPath) versions.set(ownerPath, Number(response.headers.get("X-Owner-Revision")));
+    const recordVersion = response.headers.get("X-Record-Revision");
+    if (recordVersion != null && (writing || !hasPendingPath(path))) versions.set(path, Number(recordVersion));
+    const base = path.split("?")[0];
+    for (const row of Array.isArray(payload) ? payload : [payload]) {
+      if (row?._revision == null) continue;
+      if (base === "/item-images" && row.resource) imageOwners.set(row.id, row.resource === "scheduling-machine" ? "/scheduling-machine" : `/${row.resource}/${row.record_id}`);
+      const resource = base === "/prep-items" ? row.itemType === "story" ? "/story-bank" : "/case-framework" : base;
+      const rowPath = base === "/prep-sections" || ["/settings", "/scheduling-machine"].includes(base) || /\/\d+$/.test(base) ? path : `${resource}/${row.id}`;
+      if (writing || !hasPendingPath(rowPath)) versions.set(rowPath, row._revision);
+    }
+  }
+  return payload;
+}
+
+function publishConflict(error) {
+  blocked = error;
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("data-conflict", { detail: error }));
+}
+
+export const getUnsavedDrafts = () => ({ capturedAt: timestamp(), operations: [...pending.values()], conflict: blocked ? { path: blocked.path, method: blocked.options.method, draft: blocked.options.body } : null });
+export async function latestConflictVersion(error) {
+  if (error.code === "DATASET_CHANGED") return { message: "All workspaces were replaced. Download your draft before loading the new dataset. Retrying a pre-restore write is not allowed." };
+  const path = error.path === "/convert-item" ? `/${error.options.body.source}/${error.options.body.id}` : error.comparisonPath || error.path;
+  try { return await api(path, { track: false, onRevision: (value) => { error.latestRevision = value; } }); }
+  catch (failure) { if (failure.status === 404) return { deleted: true, message: "This record was deleted by another client." }; throw failure; }
 }
 
 const timestamp = () => new Date().toISOString();
@@ -70,11 +139,13 @@ const baseItem = (resource, row, fields) => {
     content: { ...(ui.content || {}), ...(fields.content || { notes: "" }) },
     id: `${resource}:${row.id}`,
     roundIds: Array.isArray(row.roundIds) ? row.roundIds : [],
+    legacyAnswers: row.legacyAnswers?.length ? row.legacyAnswers : ui.legacyAnswers || [],
   };
 };
 
 function rememberItem(item, resource, dbId) {
   itemIdentities.set(item.id, { resource, dbId });
+  if (!pending.has(`item:${item.id}`)) baselines.set(`item:${item.id}`, itemPayload(item, resource));
   return item;
 }
 
@@ -199,7 +270,7 @@ function rowToTree(row) {
     });
   }
   treeIdentities.set(treeId, row.id);
-  return {
+  const tree = {
     id: treeId,
     module: row.module || "",
     roundId: row.round_id ?? null,
@@ -213,12 +284,11 @@ function rowToTree(row) {
     quickReviewNotes: ui.quickReviewNotes || "",
     nodes,
   };
+  if (!pending.has(`tree:${treeId}`)) baselines.set(`tree:${treeId}`, drillPayload(tree));
+  return tree;
 }
 
 async function loadDatabaseData() {
-  itemIdentities.clear();
-  treeIdentities.clear();
-  followupIdentities.clear();
   const [settings, workspacesResponse] = await Promise.all([
     api("/settings"),
     api("/workspaces"),
@@ -263,6 +333,9 @@ async function loadDatabaseData() {
     drillTrees: trees.map(rowToTree),
   };
 
+  if (!pending.has("settings")) baselines.set("settings", { _ui: { activeWorkspaceId: data.activeWorkspaceId } });
+  const sectionsKey = `sections:${data.activeWorkspaceId}`;
+  if (!pending.has(sectionsKey)) baselines.set(sectionsKey, { sections: data.settings.preparationModules });
   return data;
 }
 
@@ -272,9 +345,6 @@ export function loadData() {
 }
 
 export async function loadRoundFilteredContent(roundId = null, workspaceId = null) {
-  itemIdentities.clear();
-  treeIdentities.clear();
-  followupIdentities.clear();
   const roundQuery = Number.isInteger(roundId) && roundId > 0 ? `&round_id=${roundId}` : "";
   const query = Number.isInteger(roundId) && roundId > 0 ? `?round_id=${roundId}` : "";
   const [prepItems, questions, trees, scheduling, incidents, translations, knowledge, images] = await Promise.all([
@@ -296,7 +366,7 @@ export async function loadRoundFilteredContent(roundId = null, workspaceId = nul
 }
 
 function resourceForItem(item) {
-  if (item.module === "scheduling-machine" && item.title === "Platform overview and scale" && item.type === "note") return "scheduling-machine";
+  if (itemIdentities.get(item.id)?.resource === "scheduling-machine") return "scheduling-machine";
   if (item.type === "story") return "story-bank";
   if (item.type === "case-framework") return "case-framework";
   if (item.type === "question" || item.type === "pitch" || item.type === "open-question") return "question-bank";
@@ -319,6 +389,7 @@ function itemPayload(item, resource) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     content: item.content || { notes: "" },
+    ...(item.legacyAnswers?.length ? { legacyAnswers: item.legacyAnswers } : {}),
   };
   if (resource === "story-bank") return {
     module: item.module,
@@ -386,37 +457,6 @@ async function deleteItemResource({ resource, dbId }) {
   return api(`/${resource}/${dbId}`, { method: "DELETE" });
 }
 
-async function persistItems(items) {
-  const currentIds = new Set(items.map((item) => item.id));
-  for (const [clientId, identity] of [...itemIdentities]) {
-    if (!currentIds.has(clientId)) {
-      await deleteItemResource(identity);
-      itemIdentities.delete(clientId);
-    }
-  }
-
-  for (const item of items) {
-    const desiredResource = resourceForItem(item);
-    let identity = itemIdentities.get(item.id);
-    if (identity && identity.resource !== desiredResource) {
-      await deleteItemResource(identity);
-      itemIdentities.delete(item.id);
-      identity = null;
-    }
-    const body = itemPayload(item, desiredResource);
-    if (identity) {
-      const path = desiredResource === "scheduling-machine" ? "/scheduling-machine" : `/${desiredResource}/${identity.dbId}`;
-      await api(path, { method: "PUT", body });
-    } else if (desiredResource === "scheduling-machine") {
-      await api("/scheduling-machine", { method: "PUT", body });
-      itemIdentities.set(item.id, { resource: desiredResource, dbId: 1 });
-    } else {
-      const created = await api(`/${desiredResource}`, { method: "POST", body });
-      itemIdentities.set(item.id, { resource: desiredResource, dbId: created.id });
-    }
-  }
-}
-
 function drillPayload(tree) {
   return {
     module: tree.module,
@@ -450,45 +490,147 @@ function rememberFollowupResponses(tree, response) {
   });
 }
 
-async function persistTrees(trees) {
-  const currentIds = new Set(trees.map((tree) => tree.id));
-  for (const [clientId, dbId] of [...treeIdentities]) {
-    if (!currentIds.has(clientId)) {
-      await api(`/drill-trees/${dbId}`, { method: "DELETE" });
-      treeIdentities.delete(clientId);
-      for (const key of [...followupIdentities.keys()]) if (key.startsWith(`${clientId}:`)) followupIdentities.delete(key);
+const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+function changedFields(before, after) {
+  if (!before) return after;
+  return Object.fromEntries(Object.entries(after).filter(([key, value]) => !equal(before[key], value)).map(([key, value]) => [key,
+    key === "_ui" ? Object.fromEntries(Object.entries(value).filter(([field, v]) => !equal(before._ui?.[field], v)).map(([field, v]) => [field, field === "content" ? changedFields(before._ui?.content, v) : v])) : value,
+  ]));
+}
+
+function enqueue(key, job, payload) {
+  if (pending.get(key)?.deleted) return;
+  // A newer snapshot replaces only this identity's queued draft. Hidden items
+  // remain in this map; absence from a view never means deletion.
+  if (!equal(baselines.get(key), payload) || pending.has(key)) pending.set(key, { ...job, payload });
+}
+
+export function queueItemDeletion(item) { pending.set(`item:${item.id}`, { kind: "item", value: item, deleted: true }); }
+export function queueTreeDeletion(tree) { pending.set(`tree:${tree.id}`, { kind: "tree", value: tree, deleted: true }); }
+
+async function persistJob(key, job) {
+  if (job.kind === "item") {
+    const item = job.value;
+    const identity = itemIdentities.get(item.id);
+    if (job.deleted) {
+      if (identity) await deleteItemResource(identity);
+      itemIdentities.delete(item.id);
+      baselines.delete(key);
+      return;
     }
-  }
-  for (const tree of trees) {
-    const dbId = treeIdentities.get(tree.id);
-    const response = dbId
-      ? await api(`/drill-trees/${dbId}`, { method: "PUT", body: drillPayload(tree) })
-      : await api("/drill-trees", { method: "POST", body: drillPayload(tree) });
-    if (!dbId) treeIdentities.set(tree.id, response.id);
-    rememberFollowupResponses(tree, response);
+    const resource = resourceForItem(item);
+    const body = itemPayload(item, resource);
+    let response;
+    if (identity && identity.resource !== resource) {
+      const oldPath = `/${identity.resource}/${identity.dbId}`;
+      response = await api("/convert-item", { method: "POST", body: { source: identity.resource, id: identity.dbId, expectedRevision: versions.get(oldPath), target: resource, item: body } });
+      itemIdentities.set(item.id, { resource, dbId: response.id });
+      versions.set(`/${resource}/${response.id}`, response._revision);
+      if (item.images?.length) await api(`/item-images?resource=${resource}&record_id=${response.id}`);
+    } else if (identity) {
+      const delta = changedFields(baselines.get(key), body);
+      if (Object.keys(delta).length) response = await api(resource === "scheduling-machine" ? "/scheduling-machine" : `/${resource}/${identity.dbId}`, { method: "PUT", body: delta });
+    } else {
+      response = await api(`/${resource}`, { method: "POST", body });
+      itemIdentities.set(item.id, { resource, dbId: response.id });
+    }
+    baselines.set(key, body);
+  } else if (job.kind === "tree") {
+    const tree = job.value;
+    const id = treeIdentities.get(tree.id);
+    if (job.deleted) {
+      if (id) await api(`/drill-trees/${id}`, { method: "DELETE" });
+      treeIdentities.delete(tree.id);
+      baselines.delete(key);
+      return;
+    }
+    const body = drillPayload(tree);
+    const delta = changedFields(baselines.get(key), body);
+    if (!id || Object.keys(delta).length) {
+      const response = await api(id ? `/drill-trees/${id}` : "/drill-trees", { method: id ? "PUT" : "POST", body: id ? delta : body });
+      treeIdentities.set(tree.id, response.id);
+      rememberFollowupResponses(tree, response);
+    }
+    baselines.set(key, drillPayload(tree));
+  } else {
+    const delta = changedFields(baselines.get(key), job.payload);
+    if (Object.keys(delta).length) await api(job.path, { method: "PUT", body: delta });
+    baselines.set(key, job.payload);
   }
 }
 
-async function persistData(data) {
-  await api("/settings", { method: "PUT", body: {
-    _ui: {
-      activeWorkspaceId: data.activeWorkspaceId,
-    },
-  } });
-  if (Number.isInteger(data.activeWorkspaceId) && data.activeWorkspaceId > 0) {
-    await api(`/prep-sections?workspace_id=${data.activeWorkspaceId}`, {
-      method: "PUT",
-      body: { sections: data.settings.preparationModules || [] },
-    });
-  }
-  await persistItems(data.items || []);
-  await persistTrees(data.drillTrees || []);
+async function drain() {
+  if (blocked) throw blocked;
+  if (running) return running;
+  const operationEpoch = epoch;
+  running = (async () => {
+    // Yield once so running is assigned even when there are no pending jobs.
+    await Promise.resolve();
+    while (pending.size) {
+      const [key, job] = pending.entries().next().value;
+      if (operationEpoch !== epoch) throw new Error("Save queue invalidated by dataset replacement");
+      try { await persistJob(key, job); }
+      catch (error) { error.jobKey = key; if (error.status === 409) publishConflict(error); throw error; }
+      if (pending.get(key) === job) pending.delete(key);
+    }
+  })();
+  try { await running; } finally { running = undefined; }
 }
 
 export function saveData(data) {
-  const run = saveQueue.catch(() => undefined).then(() => persistData(data));
-  saveQueue = run;
-  return run;
+  enqueue("settings", { kind: "settings", path: "/settings" }, { _ui: { activeWorkspaceId: data.activeWorkspaceId } });
+  if (Number.isInteger(data.activeWorkspaceId)) enqueue(`sections:${data.activeWorkspaceId}`, { kind: "sections", path: `/prep-sections?workspace_id=${data.activeWorkspaceId}` }, { sections: data.settings.preparationModules || [] });
+  for (const item of data.items || []) enqueue(`item:${item.id}`, { kind: "item", value: structuredClone(item) }, itemPayload(item, resourceForItem(item)));
+  for (const tree of data.drillTrees || []) enqueue(`tree:${tree.id}`, { kind: "tree", value: structuredClone(tree) }, drillPayload(tree));
+  return drain();
+}
+
+export async function resolveDataConflict(choice, latest) {
+  const error = blocked;
+  if (!error) return;
+  if (error.code === "DATASET_CHANGED") {
+    if (choice !== "saved") throw new Error("Pre-restore writes cannot be retried against the new dataset");
+    return reloadCanonicalData();
+  }
+  if (choice === "saved") {
+    if (error.jobKey) pending.delete(error.jobKey);
+  } else {
+    const version = (Array.isArray(latest) ? latest[0]?._revision : latest?._revision) ?? error.latestRevision;
+    // Empty section lists still have a revision header, fetched explicitly below.
+    if (version != null) {
+      if (error.path === "/convert-item") {
+        versions.set(`/${error.options.body.source}/${error.options.body.id}`, version);
+        error.options.body.expectedRevision = version;
+      } else versions.set(error.comparisonPath || error.path, version);
+    }
+    else await api(error.path);
+  }
+  blocked = undefined;
+  if (choice !== "saved" && !error.jobKey) await api(error.path, error.options);
+  await drain();
+  return reloadCanonicalData();
+}
+
+export async function reloadCanonicalData() {
+  epoch += 1;
+  itemIdentities.clear(); treeIdentities.clear(); followupIdentities.clear(); imageOwners.clear();
+  versions.clear(); baselines.clear(); pending.clear(); blocked = undefined;
+  datasetGeneration = undefined;
+  initialLoadPromise = undefined;
+  return loadData();
+}
+
+export const exportBackup = () => api("/backup");
+export const previewBackup = (backup) => api("/backup/preview", { method: "POST", body: backup });
+export async function restoreBackup(backup) {
+  await drain();
+  const result = await api("/backup/restore", { method: "POST", body: backup, headers: { "X-Confirm-Replacement": "replace-all-workspaces" }, allowGenerationChange: true });
+  return { ...result, data: await reloadCanonicalData() };
+}
+export async function resetDataset() {
+  await drain();
+  const result = await api("/reset", { method: "POST", headers: { "X-Confirm-Replacement": "replace-all-workspaces" }, allowGenerationChange: true });
+  return { ...result, data: await reloadCanonicalData() };
 }
 
 function roundFromApi(round) {
@@ -520,7 +662,9 @@ function prepSectionFromApi(section) {
 }
 
 export async function loadPrepSections(workspaceId) {
-  return (await api(`/prep-sections?workspace_id=${workspaceId}`)).map(prepSectionFromApi);
+  const sections = (await api(`/prep-sections?workspace_id=${workspaceId}`)).map(prepSectionFromApi);
+  if (!pending.has(`sections:${workspaceId}`)) baselines.set(`sections:${workspaceId}`, { sections });
+  return sections;
 }
 
 const roundToApi = (round) => ({
@@ -589,7 +733,7 @@ export async function uploadItemImage(itemId, file) {
     throw new Error("Supported image types: .jpg, .jpeg, .png, .gif, .svg, and .heic");
   }
   if (file.size > 12 * 1024 * 1024) throw new Error("Images must be 12 MB or smaller");
-  return api("/item-images", { method: "POST", body: {
+  return api("/item-images", { method: "POST", ownerPath: identity.resource === "scheduling-machine" ? "/scheduling-machine" : `/${identity.resource}/${identity.dbId}`, body: {
     resource: identity.resource,
     record_id: identity.dbId,
     filename: file.name,
@@ -598,7 +742,7 @@ export async function uploadItemImage(itemId, file) {
 }
 
 export function deleteItemImage(imageId) {
-  return api(`/item-images/${imageId}`, { method: "DELETE" });
+  return api(`/item-images/${imageId}`, { method: "DELETE", ownerPath: imageOwners.get(imageId) });
 }
 
 export function statusWeight(status) {

@@ -2,13 +2,13 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CASE_FRAMEWORK_STAGES } from "./caseFramework.js";
+import { initializeRevisions, preserveLegacyAnswers } from "./reliability.js";
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
-const dataDirectory = path.join(projectRoot, "data");
+const dataDirectory = process.env.DATABASE_PATH ? path.dirname(path.resolve(process.env.DATABASE_PATH)) : path.join(projectRoot, "data");
 fs.mkdirSync(dataDirectory, { recursive: true });
 
-export const databasePath = path.join(dataDirectory, "interview-prep.db");
+export const databasePath = process.env.DATABASE_PATH ? path.resolve(process.env.DATABASE_PATH) : path.join(dataDirectory, "interview-prep.db");
 export const db = new Database(databasePath);
 
 db.pragma("journal_mode = WAL");
@@ -195,36 +195,7 @@ db.prepare(`
 
 const tableColumns = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
 
-const legacyCaseFrameworkStages = ["understand", "define", "solve", "prove"];
-db.transaction(() => {
-  let columns = tableColumns("case_framework_bank");
-  for (const { key } of CASE_FRAMEWORK_STAGES) {
-    if (!columns.has(key)) db.exec(`ALTER TABLE case_framework_bank ADD COLUMN ${key} TEXT`);
-  }
-  columns = tableColumns("case_framework_bank");
-  for (const key of legacyCaseFrameworkStages) {
-    if (columns.has(key)) db.exec(`ALTER TABLE case_framework_bank DROP COLUMN ${key}`);
-  }
-
-  const metadataRows = db.prepare("SELECT record_id, value FROM app_metadata WHERE resource = 'case-framework'").all();
-  const updateMetadata = db.prepare("UPDATE app_metadata SET value = ? WHERE resource = 'case-framework' AND record_id = ?");
-  for (const row of metadataRows) {
-    try {
-      const metadata = JSON.parse(row.value);
-      if (!metadata?.content || typeof metadata.content !== "object") continue;
-      let changed = false;
-      for (const key of legacyCaseFrameworkStages) {
-        if (Object.prototype.hasOwnProperty.call(metadata.content, key)) {
-          delete metadata.content[key];
-          changed = true;
-        }
-      }
-      if (changed) updateMetadata.run(JSON.stringify(metadata), row.record_id);
-    } catch {
-      // Leave unrelated or malformed metadata untouched.
-    }
-  }
-})();
+await preserveLegacyAnswers(db, process.env.RECOVERY_DIRECTORY || path.join(dataDirectory, "recovery"));
 
 if (!tableColumns("drill_trees").has("round_id")) {
   db.exec("ALTER TABLE drill_trees ADD COLUMN round_id INTEGER REFERENCES interview_rounds(id) ON DELETE SET NULL");
@@ -289,6 +260,8 @@ if (!migrationComplete) {
     `).run(migrationKey);
   })();
 }
+
+initializeRevisions(db);
 
 const legacyPrepSectionsMigrationKey = "workspace-prep-sections-v1";
 const legacyPrepSectionsMigrationComplete = db.prepare("SELECT 1 FROM app_metadata WHERE resource = 'migration' AND record_id = 2 AND value = ?").get(legacyPrepSectionsMigrationKey);

@@ -4,15 +4,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { db, databasePath } from "./db.js";
 import { CASE_FRAMEWORK_STAGES } from "./caseFramework.js";
+import { installReliability } from "./reliability-http.js";
+import { checkWrite, revision } from "./reliability.js";
 
-const app = express();
+export const app = express();
 const port = Number(process.env.PORT || 5173);
 const host = process.env.HOST || "0.0.0.0";
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === "production";
 
 app.use(cors());
+app.use("/api/backup", express.json({ limit: "256mb" }));
 app.use(express.json({ limit: "20mb" }));
+const writes = installReliability(app, db, databasePath);
 
 const jsonColumns = {
   settings: new Set(["interviewers"]),
@@ -61,7 +65,9 @@ function writeMetadata(resource, recordId, value) {
   db.prepare(`
     INSERT INTO app_metadata (resource, record_id, value) VALUES (?, ?, ?)
     ON CONFLICT(resource, record_id) DO UPDATE SET value = excluded.value
-  `).run(resource, recordId, JSON.stringify(value));
+  `).run(resource, recordId, JSON.stringify({ ...readMetadata(resource, recordId), ...value,
+    ...(value.content ? { content: { ...readMetadata(resource, recordId).content, ...value.content } } : {}),
+  }));
 }
 
 function deleteMetadata(resource, recordId) {
@@ -74,7 +80,9 @@ function deleteImages(resource, recordId) {
 
 function withMetadata(table, resource, row) {
   if (!row) return row;
-  return { ...serializeRow(table, row), _ui: readMetadata(resource, row.id) };
+  return { ...serializeRow(table, row), _ui: readMetadata(resource, row.id),
+    ...(resource === "case-framework" ? { legacyAnswers: db.prepare("SELECT stage, source, answer FROM case_legacy_answers WHERE case_id = ? ORDER BY id").all(row.id) } : {}),
+  };
 }
 
 function sanitizeBody(table, columns, body) {
@@ -107,7 +115,9 @@ function syncItemRoundTags(itemType, itemId, roundIds) {
   for (const roundId of normalized) insert.run(itemType, itemId, roundId);
 }
 
+const crudConfigs = new Map();
 function registerCrudRoute(route, table, columns, itemType, { workspaceScoped = false } = {}) {
+  crudConfigs.set(route, { table, columns, itemType, workspaceScoped });
   app.get(`/api/${route}`, (req, res) => {
     const requestedRoundId = Number(req.query.round_id);
     const hasRoundFilter = Number.isInteger(requestedRoundId) && requestedRoundId > 0;
@@ -139,7 +149,7 @@ function registerCrudRoute(route, table, columns, itemType, { workspaceScoped = 
     return res.json(withItemRoundTags(table, route, itemType, row));
   });
 
-  app.post(`/api/${route}`, (req, res) => {
+  writes.post(`/api/${route}`, (req, res) => {
     if (workspaceScoped) {
       const workspaceId = Number(req.body?.workspace_id);
       if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
@@ -161,7 +171,7 @@ function registerCrudRoute(route, table, columns, itemType, { workspaceScoped = 
     res.status(201).json(withItemRoundTags(table, route, itemType, row));
   });
 
-  app.put(`/api/${route}/:id`, (req, res) => {
+  writes.put(`/api/${route}/:id`, (req, res) => {
     const existing = db.prepare(`SELECT id FROM ${table} WHERE id = ?`).get(req.params.id);
     if (!existing) return sendNotFound(res);
     if (workspaceScoped && Object.prototype.hasOwnProperty.call(req.body || {}, "workspace_id")) {
@@ -184,7 +194,7 @@ function registerCrudRoute(route, table, columns, itemType, { workspaceScoped = 
     return res.json(withItemRoundTags(table, route, itemType, row));
   });
 
-  app.delete(`/api/${route}/:id`, (req, res) => {
+  writes.delete(`/api/${route}/:id`, (req, res) => {
     const result = db.transaction(() => {
       const deletion = db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(req.params.id);
       if (!deletion.changes) return deletion;
@@ -202,7 +212,7 @@ const settingsColumns = ["company_name", "role_title", "interview_date", "interv
 app.get("/api/settings", (_req, res) => {
   res.json(withMetadata("settings", "settings", db.prepare("SELECT * FROM settings WHERE id = 1").get()));
 });
-app.put("/api/settings", (req, res) => {
+writes.put("/api/settings", (req, res) => {
   const values = sanitizeBody("settings", settingsColumns, req.body || {});
   const keys = Object.keys(values);
   if (keys.length) {
@@ -224,7 +234,7 @@ app.get("/api/workspaces", (_req, res) => {
   res.json(db.prepare("SELECT id, company_name, role_title, created_at FROM workspaces ORDER BY created_at, id").all());
 });
 
-app.post("/api/workspaces", (req, res) => {
+writes.post("/api/workspaces", (req, res) => {
   const values = sanitizeBody("workspaces", workspaceColumns, req.body || {});
   const result = db.prepare("INSERT INTO workspaces (company_name, role_title) VALUES (?, ?)")
     .run(values.company_name || "Untitled company", values.role_title || "");
@@ -237,7 +247,7 @@ app.get("/api/workspaces/:id", (req, res) => {
   return res.json(workspace);
 });
 
-app.put("/api/workspaces/:id", (req, res) => {
+writes.put("/api/workspaces/:id", (req, res) => {
   if (!db.prepare("SELECT id FROM workspaces WHERE id = ?").get(req.params.id)) return sendNotFound(res, "Workspace");
   const values = sanitizeBody("workspaces", workspaceColumns, req.body || {});
   const keys = Object.keys(values);
@@ -270,12 +280,13 @@ app.get("/api/prep-sections", (req, res) => {
   return res.json(sections.map(serializePrepSection));
 });
 
-app.put("/api/prep-sections", (req, res) => {
+writes.put("/api/prep-sections", (req, res) => {
   const workspaceId = Number(req.query.workspace_id);
   if (!Number.isInteger(workspaceId) || workspaceId <= 0 || !db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId)) {
     return res.status(400).json({ error: "A valid workspace_id is required" });
   }
-  const sections = Array.isArray(req.body?.sections) ? req.body.sections : [];
+  if (!Array.isArray(req.body?.sections)) return res.status(400).json({ error: "A sections array is required" });
+  const sections = req.body.sections;
   const normalized = sections.map((section, index) => ({
     moduleKey: String(section.id || "").trim(),
     label: String(section.label || "").trim(),
@@ -289,19 +300,27 @@ app.put("/api/prep-sections", (req, res) => {
     return res.status(400).json({ error: "Each preparation section requires a unique id and label" });
   }
   db.transaction(() => {
-    db.prepare("DELETE FROM prep_sections WHERE workspace_id = ?").run(workspaceId);
+    const existing = new Map(db.prepare("SELECT * FROM prep_sections WHERE workspace_id = ?").all(workspaceId).map((row) => [row.module_key, row]));
     const insert = db.prepare(`
       INSERT INTO prep_sections
         (workspace_id, module_key, label, short, color, description, sequence_order, is_builtin)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    for (const section of normalized) insert.run(workspaceId, section.moduleKey, section.label, section.short, section.color, section.description, section.sequenceOrder, section.isBuiltin);
+    const update = db.prepare("UPDATE prep_sections SET label=?, short=?, color=?, description=?, sequence_order=?, is_builtin=? WHERE id=? AND workspace_id=?");
+    for (const section of normalized) {
+      const row = existing.get(section.moduleKey);
+      const values = [section.label, section.short, section.color, section.description, section.sequenceOrder, section.isBuiltin];
+      if (!row) insert.run(workspaceId, section.moduleKey, ...values);
+      else if (JSON.stringify(values) !== JSON.stringify([row.label, row.short, row.color, row.description, row.sequence_order, row.is_builtin])) update.run(...values, row.id, workspaceId);
+      existing.delete(section.moduleKey);
+    }
+    for (const row of existing.values()) db.prepare("DELETE FROM prep_sections WHERE id=? AND workspace_id=?").run(row.id, workspaceId);
   })();
   const saved = db.prepare("SELECT * FROM prep_sections WHERE workspace_id = ? ORDER BY sequence_order, id").all(workspaceId);
   return res.json(saved.map(serializePrepSection));
 });
 
-app.delete("/api/workspaces/:id", (req, res) => {
+writes.delete("/api/workspaces/:id", (req, res) => {
   const result = db.transaction(() => {
     const caseIds = db.prepare("SELECT id FROM case_framework_bank WHERE workspace_id = ?").all(req.params.id).map((row) => row.id);
     const deleteCaseTags = db.prepare("DELETE FROM item_round_tags WHERE item_type = 'case_framework' AND item_id = ?");
@@ -322,7 +341,7 @@ app.get("/api/workspaces/:workspaceId/rounds", (req, res) => {
   return res.json(rounds.map(serializeRound));
 });
 
-app.post("/api/workspaces/:workspaceId/rounds", (req, res) => {
+writes.post("/api/workspaces/:workspaceId/rounds", (req, res) => {
   if (!db.prepare("SELECT id FROM workspaces WHERE id = ?").get(req.params.workspaceId)) return sendNotFound(res, "Workspace");
   const values = sanitizeBody("interview_rounds", roundColumns, req.body || {});
   const nextOrder = db.prepare("SELECT coalesce(max(sequence_order), 0) + 1 AS value FROM interview_rounds WHERE workspace_id = ?").get(req.params.workspaceId).value;
@@ -351,7 +370,7 @@ app.get("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
   return res.json(serializeRound(round));
 });
 
-app.put("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
+writes.put("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
   if (!db.prepare("SELECT id FROM interview_rounds WHERE id = ? AND workspace_id = ?").get(req.params.id, req.params.workspaceId)) return sendNotFound(res, "Interview round");
   const values = sanitizeBody("interview_rounds", roundColumns, req.body || {});
   const keys = Object.keys(values);
@@ -362,7 +381,7 @@ app.put("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
   return res.json(serializeRound(db.prepare("SELECT * FROM interview_rounds WHERE id = ?").get(req.params.id)));
 });
 
-app.delete("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
+writes.delete("/api/workspaces/:workspaceId/rounds/:id", (req, res) => {
   const result = db.prepare("DELETE FROM interview_rounds WHERE id = ? AND workspace_id = ?").run(req.params.id, req.params.workspaceId);
   if (!result.changes) return sendNotFound(res, "Interview round");
   return res.status(204).end();
@@ -374,6 +393,28 @@ registerCrudRoute("question-bank", "question_bank", ["module", "sub_topic", "que
 registerCrudRoute("reliability-incidents", "reliability_incidents", ["title", "what_broke", "how_found", "how_fixed", "what_changed_after", "tags"], "reliability_incident");
 registerCrudRoute("translation-map", "translation_map", ["scheduling_machine_pattern", "tempus_problem", "what_i_bring"], "translation_map");
 registerCrudRoute("knowledge-items", "knowledge_items", ["module", "term", "definition", "notes", "tags"], "knowledge_item");
+
+// Changing an existing item's type is one guarded operation: never delete the
+// original before discovering that creating its replacement failed.
+writes.post("/api/convert-item", (req, res) => {
+  const { source, target, id, expectedRevision, item } = req.body || {};
+  const from = crudConfigs.get(source);
+  const to = crudConfigs.get(target);
+  if (!from || !to || !item) return res.status(400).json({ error: "Invalid item conversion" });
+  checkWrite(db, req.get("X-Dataset-Generation"), source, id, expectedRevision);
+  if (!db.prepare(`SELECT id FROM ${from.table} WHERE id = ?`).get(id)) return sendNotFound(res);
+  const values = sanitizeBody(to.table, to.columns, item);
+  const keys = Object.keys(values);
+  const result = db.prepare(`INSERT INTO ${to.table} (${keys.join(",")}) VALUES (${keys.map(() => "?").join(",")})`).run(...keys.map((key) => values[key]));
+  const newId = Number(result.lastInsertRowid);
+  writeMetadata(target, newId, item._ui);
+  syncItemRoundTags(to.itemType, newId, item.roundIds);
+  db.prepare("UPDATE item_images SET resource = ?, record_id = ? WHERE resource = ? AND record_id = ?").run(target, newId, source, id);
+  db.prepare(`DELETE FROM ${from.table} WHERE id = ?`).run(id);
+  db.prepare("DELETE FROM item_round_tags WHERE item_type = ? AND item_id = ?").run(from.itemType, id);
+  deleteMetadata(source, id);
+  return res.json({ ...withItemRoundTags(to.table, target, to.itemType, db.prepare(`SELECT * FROM ${to.table} WHERE id = ?`).get(newId)), _revision: revision(db, target, newId) });
+});
 
 function prepItemRows(table, itemType, roundId, workspaceId = null) {
   const filters = [];
@@ -414,7 +455,7 @@ const schedulingColumns = ["overview", "architecture_notes", "ownership_stories"
 app.get("/api/scheduling-machine", (_req, res) => {
   res.json(withMetadata("scheduling_machine", "scheduling-machine", db.prepare("SELECT * FROM scheduling_machine WHERE id = 1").get()));
 });
-app.put("/api/scheduling-machine", (req, res) => {
+writes.put("/api/scheduling-machine", (req, res) => {
   const values = sanitizeBody("scheduling_machine", schedulingColumns, req.body || {});
   const keys = Object.keys(values);
   if (keys.length) {
@@ -492,7 +533,7 @@ const writeDrillTree = db.transaction((id, body) => {
   }
 });
 
-app.post("/api/drill-trees", (req, res) => {
+writes.post("/api/drill-trees", (req, res) => {
   const roundId = Number.isInteger(req.body?.round_id) ? req.body.round_id : null;
   const result = db.prepare("INSERT INTO drill_trees (module, root_question, round_id) VALUES (?, ?, ?)")
     .run(req.body?.module ?? "", req.body?.root_question ?? "", roundId);
@@ -500,13 +541,13 @@ app.post("/api/drill-trees", (req, res) => {
   res.status(201).json(getDrillTree(result.lastInsertRowid));
 });
 
-app.put("/api/drill-trees/:id", (req, res) => {
+writes.put("/api/drill-trees/:id", (req, res) => {
   if (!db.prepare("SELECT id FROM drill_trees WHERE id = ?").get(req.params.id)) return sendNotFound(res, "Drill tree");
   writeDrillTree(Number(req.params.id), req.body || {});
   return res.json(getDrillTree(req.params.id));
 });
 
-app.delete("/api/drill-trees/:id", (req, res) => {
+writes.delete("/api/drill-trees/:id", (req, res) => {
   const result = db.prepare("DELETE FROM drill_trees WHERE id = ?").run(req.params.id);
   if (!result.changes) return sendNotFound(res, "Drill tree");
   deleteMetadata("drill-trees", Number(req.params.id));
@@ -551,7 +592,7 @@ app.get("/api/item-images", (req, res) => {
   res.json(rows.map(imageMetadata));
 });
 
-app.post("/api/item-images", (req, res) => {
+writes.post("/api/item-images", (req, res) => {
   const { resource, record_id: recordId, filename, data } = req.body || {};
   const extension = String(filename || "").split(".").pop()?.toLowerCase();
   const mimeType = supportedImageTypes.get(extension);
@@ -580,7 +621,7 @@ app.get("/api/item-images/:id", (req, res) => {
   return res.send(row.data);
 });
 
-app.delete("/api/item-images/:id", (req, res) => {
+writes.delete("/api/item-images/:id", (req, res) => {
   const result = db.prepare("DELETE FROM item_images WHERE id = ?").run(req.params.id);
   if (!result.changes) return sendNotFound(res, "Image");
   return res.status(204).end();
@@ -637,11 +678,13 @@ app.get("/api/search", (req, res) => {
 });
 
 app.use((error, _req, res, _next) => {
-  console.error(error);
-  res.status(500).json({ error: "Internal server error" });
+  if (!error.status || error.status >= 500) console.error(error);
+  res.status(error.status || 500).json({ error: error.status ? error.message : "Internal server error", code: error.code, resource: error.resource, recordId: error.recordId, revision: error.revision });
 });
 
-if (isProduction) {
+if (process.env.API_ONLY === "1") {
+  // Tests import the real app and bind their own ephemeral port and temp database.
+} else if (isProduction) {
   app.use(express.static(path.join(projectRoot, "dist")));
   app.use((_req, res) => res.sendFile(path.join(projectRoot, "dist", "index.html")));
   app.listen(port, host, () => console.log(`Interview Prep Dashboard listening on http://${host}:${port}\nSQLite: ${databasePath}`));

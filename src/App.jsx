@@ -116,7 +116,7 @@ function ItemMarkdownContent({ item, emptyText = "No notes added yet." }) {
   );
 }
 
-export function CombinedPreview({ title, metadata = null, sections = [] }) {
+function PreviewBody({ title, metadata = null, sections = [] }) {
   const populatedSections = sections.filter(({ content }) => String(content || "").trim());
   return (
     <section className="combined-preview">
@@ -133,6 +133,10 @@ export function CombinedPreview({ title, metadata = null, sections = [] }) {
       </div>
     </section>
   );
+}
+
+export function CombinedPreview(props) {
+  return <PreviewBody {...props} />;
 }
 
 function PreviewMetadata({ item, showStatus = false, showTags = false }) {
@@ -205,6 +209,13 @@ function previewShapeForItem(item, stageConfig = []) {
   };
 }
 
+function preparationItemPreviewProps(item) {
+  const stageConfig = item.itemType === "case_framework" || item.type === "case-framework"
+    ? CASE_FRAMEWORK_STAGES
+    : item.itemType === "story" || item.type === "story" ? STORY_STAGES : [];
+  return previewShapeForItem(item, stageConfig);
+}
+
 function previewShapeForTree(tree) {
   const nodes = [...(tree.nodes || [])].sort((a, b) => a.level - b.level);
   const root = nodes.find((node) => node.level === 0) || nodes[0];
@@ -237,6 +248,119 @@ function CombinedPreviewModal({ preview, close }) {
       <section className="combined-preview-dialog" role="dialog" aria-modal="true" aria-label={`Preview: ${preview.title || "Untitled item"}`}>
         <button type="button" className="dialog-close" onClick={close} aria-label="Close item preview">×</button>
         <CombinedPreview {...preview} />
+      </section>
+    </div>
+  );
+}
+
+const JUMP_TO_COMPACT_THRESHOLD = 8;
+
+function SectionPreviewAll({ items, buildPreviewProps, close }) {
+  const scrollContainerRef = useRef(null);
+  const jumpToRef = useRef(null);
+  const pendingJumpRef = useRef(null);
+  const [jumpToCompact, setJumpToCompact] = useState(() => items.length > JUMP_TO_COMPACT_THRESHOLD);
+  const [activeItemId, setActiveItemId] = useState(() => items[0]?.id ?? null);
+
+  const updateJumpToOffset = () => {
+    const jumpTo = jumpToRef.current;
+    const scrollContainer = scrollContainerRef.current;
+    if (!jumpTo || !scrollContainer) return;
+    const height = Math.ceil(jumpTo.getBoundingClientRect().height);
+    scrollContainer.style.setProperty("--jump-to-offset", `${height}px`);
+  };
+
+  const scrollToPreview = (anchor) => {
+    document.getElementById(anchor)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event) => event.key === "Escape" && close();
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [close]);
+
+  useEffect(() => {
+    const jumpTo = jumpToRef.current;
+    if (!jumpTo || !scrollContainerRef.current) return undefined;
+    updateJumpToOffset();
+
+    let observer;
+    if (typeof ResizeObserver === "function") {
+      observer = new ResizeObserver(updateJumpToOffset);
+      observer.observe(jumpTo);
+    }
+    window.addEventListener("resize", updateJumpToOffset);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updateJumpToOffset);
+    };
+  }, []);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      updateJumpToOffset();
+      const pendingAnchor = pendingJumpRef.current;
+      if (!pendingAnchor) return;
+      pendingJumpRef.current = null;
+      window.requestAnimationFrame(() => scrollToPreview(pendingAnchor));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [jumpToCompact]);
+
+  const previews = items.map((item, index) => ({
+    item,
+    order: index + 1,
+    anchor: `preview-item-${index}-${String(item.id).replace(/[^a-zA-Z0-9_-]/g, "-")}`,
+    preview: buildPreviewProps(item),
+  }));
+
+  return (
+    <div className="dialog-backdrop combined-preview-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <section className="combined-preview-dialog section-preview-all-dialog" role="dialog" aria-modal="true" aria-labelledby="preview-all-title">
+        <button type="button" className="dialog-close" onClick={close} aria-label="Close all items preview">×</button>
+        <div className="section-preview-all-scroll" ref={scrollContainerRef}>
+          <header className="section-preview-all-heading">
+            <p className="eyebrow">Section preview</p>
+            <h1 id="preview-all-title">All preparation items</h1>
+          </header>
+          {previews.length === 0 ? <p className="section-preview-all-empty">No items yet to preview</p> : <>
+            <nav className={`section-preview-all-toc ${jumpToCompact ? "compact" : "expanded"}`} aria-label="Preview contents" ref={jumpToRef}>
+              <div className="section-preview-all-toc-heading">
+                <span>Jump to</span>
+                <button type="button" aria-expanded={!jumpToCompact} aria-controls="preview-all-jump-list" onClick={() => setJumpToCompact((compact) => !compact)}>
+                  <i aria-hidden="true">⌄</i>{jumpToCompact ? "Show titles" : "Hide titles"}
+                </button>
+              </div>
+              <ol id="preview-all-jump-list">
+                {previews.map(({ item, order, anchor, preview }) => <li key={item.id}>
+                  <a href={`#${anchor}`} className={activeItemId === item.id ? "active" : ""} title={jumpToCompact ? preview.title || "Untitled item" : undefined} aria-label={jumpToCompact ? `Jump to ${preview.title || "Untitled item"}` : undefined} onClick={(event) => {
+                    event.preventDefault();
+                    setActiveItemId(item.id);
+                    if (!jumpToCompact && items.length > JUMP_TO_COMPACT_THRESHOLD) {
+                      pendingJumpRef.current = anchor;
+                      setJumpToCompact(true);
+                    } else {
+                      scrollToPreview(anchor);
+                    }
+                  }}><b aria-hidden="true">{order}</b>{!jumpToCompact && <span>{preview.title || "Untitled item"}</span>}</a>
+                </li>)}
+              </ol>
+            </nav>
+            <div className="section-preview-all-items">
+              {previews.map(({ item, anchor, preview }) => (
+                <article id={anchor} className="section-preview-all-item" key={item.id}>
+                  <PreviewBody {...preview} />
+                </article>
+              ))}
+            </div>
+          </>}
+        </div>
       </section>
     </div>
   );
@@ -1016,6 +1140,7 @@ function Dashboard({ data, modules, onNavigate }) {
 
 function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateItem, addItem, saveNow, addImagesToItem, removeImageFromItem, updateTree, addTree, deleteTree, saveRound }) {
   const items = data.items.filter((item) => item.module === module.id).sort((a, b) => a.sortOrder - b.sortOrder);
+  const [previewAllOpen, setPreviewAllOpen] = useState(false);
   const { activeRoundId: selectedRoundId, setActiveRoundId: setSelectedRoundId } = useRoundFilter();
   const isSimulation = module.id === "hiring-manager-simulation";
   const selectedRound = data.rounds.find((round) => round.id === selectedRoundId) || null;
@@ -1042,6 +1167,7 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
       <div className="section-heading content-heading preparation-items-heading">
         <div><p className="eyebrow">Working set</p><h2>Your preparation items</h2></div>
         <div className="preparation-item-actions">
+          <button type="button" className="secondary-button" disabled={items.length === 0} title={items.length === 0 ? "Add an item before opening Preview All" : "Preview every visible item"} onClick={() => setPreviewAllOpen(true)}>◉ Preview All</button>
           <button className="primary-button" onClick={() => addItem(module.id, "question")}>＋ New Item</button>
         </div>
       </div>
@@ -1052,6 +1178,7 @@ function ModuleView({ module, data, updateItem, moveItem, deleteItem, duplicateI
       {(module.id === "hiring-manager-simulation" || trees.length > 0) && (
         <DrillSection module={module} trees={trees} updateTree={updateTree} addTree={addTree} deleteTree={deleteTree} roundId={isSimulation ? selectedRoundId : null} rounds={data.rounds} />
       )}
+      {previewAllOpen && <SectionPreviewAll items={items} buildPreviewProps={preparationItemPreviewProps} close={() => setPreviewAllOpen(false)} />}
     </main>
   );
 }
@@ -1173,7 +1300,7 @@ function ItemEditor({ item, module, modules, rounds, workspaceId, stageConfig, u
   const [formMode, setFormMode] = useState("edit");
   const [combinedPreviewOpen, setCombinedPreviewOpen] = useState(false);
   const supportsCombinedPreview = !isSchedulingOverview(item);
-  const combinedPreview = previewShapeForItem(item, stageConfig || []);
+  const combinedPreview = preparationItemPreviewProps(item);
   useEffect(() => {
     if (!previewImage) return undefined;
     const previousOverflow = document.body.style.overflow;
